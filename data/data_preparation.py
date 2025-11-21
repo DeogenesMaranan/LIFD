@@ -548,6 +548,11 @@ class PreparedForgeryDataset(TorchDataset):
             raise FileNotFoundError(f"No preprocessed samples found for split='{split}', size={target_size}.")
 
         self.records = split_df.to_dict("records")
+        for record in self.records:
+            for key in ("tar_path", "relative_path"):
+                value = record.get(key)
+                if value:
+                    record[key] = value.replace("\\", "/")
         self.include_features = include_features
         self.return_masks = return_masks
         self._tar_cache: Dict[str, tarfile.TarFile] = {}
