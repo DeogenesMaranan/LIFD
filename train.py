@@ -4,7 +4,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,46 @@ if torch.cuda.is_available():  # Enable hardware-specific speed-ups when possibl
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+
+class SoftDiceLoss(nn.Module):
+    def __init__(self, smooth: float = 1.0) -> None:
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        probs = torch.sigmoid(logits)
+        dims = (1, 2, 3)
+        intersection = (probs * targets).sum(dim=dims)
+        denom = probs.sum(dim=dims) + targets.sum(dim=dims)
+        dice = (2 * intersection + self.smooth) / (denom + self.smooth)
+        return 1.0 - dice.mean()
+
+
+class FocalLoss(nn.Module):
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: Optional[float] = 0.25,
+        pos_weight: Optional[float] = None,
+    ) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.register_buffer("_pos_weight", torch.tensor(pos_weight) if pos_weight is not None else None)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        pos_weight = self._pos_weight
+        if pos_weight is not None and pos_weight.device != logits.device:
+            pos_weight = pos_weight.to(logits.device)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction="none")
+        probs = torch.sigmoid(logits)
+        probs_t = targets * probs + (1 - targets) * (1 - probs)
+        modulating = (1.0 - probs_t).clamp(min=0) ** self.gamma
+        if self.alpha is not None:
+            alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+            modulating = modulating * alpha_t
+        return (modulating * bce).mean()
 
 
 @dataclass
@@ -57,6 +97,19 @@ class TrainConfig:
     max_train_batches: Optional[int] = None
     max_val_batches: Optional[int] = None
     resume_from: Optional[str] = None
+    include_aux_features: Optional[bool] = None
+    loss_type: str = "bce_dice"
+    bce_weight: float = 0.7
+    dice_weight: float = 0.3
+    pos_weight: Optional[float] = None
+    dice_smooth: float = 1.0
+    focal_gamma: float = 2.0
+    focal_alpha: Optional[float] = 0.25
+    eval_thresholds: Optional[List[float]] = field(default_factory=lambda: [0.3, 0.5, 0.7])
+    primary_eval_threshold: Optional[float] = None
+    lr_scheduler_type: Optional[str] = None
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 2
     model_config: HybridForgeryConfig = field(default_factory=HybridForgeryConfig)
 
     def resolved_device(self) -> torch.device:
@@ -70,10 +123,21 @@ class Trainer:
         self.config = config
         self.device = config.resolved_device()
         self.model = HybridForgeryDetector(config.model_config).to(self.device)
-        self.criterion = nn.BCEWithLogitsLoss()
+        self.criterion = self._build_loss_fn()
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
+        self.scheduler = self._build_scheduler()
+
+        raw_thresholds = config.eval_thresholds or [0.5]
+        self.eval_thresholds = sorted({float(thr) for thr in raw_thresholds}) or [0.5]
+        if config.primary_eval_threshold is not None:
+            self.primary_threshold = float(config.primary_eval_threshold)
+            if self.primary_threshold not in self.eval_thresholds:
+                self.eval_thresholds.append(self.primary_threshold)
+                self.eval_thresholds.sort()
+        else:
+            self.primary_threshold = float(self.eval_thresholds[0])
 
         self._autocast_factory = lambda enabled=True: nullcontext()
         amp_enabled = config.use_amp and self.device.type == "cuda"
@@ -109,7 +173,7 @@ class Trainer:
             prepared_root=self.config.prepared_root,
             split=split,
             target_size=self.config.target_size,
-            include_features=False,
+            include_features=self._should_include_aux_features(),
             return_masks=True,
         )
         pin_memory = self.config.pin_memory
@@ -130,9 +194,16 @@ class Trainer:
 
         return DataLoader(dataset, **loader_kwargs)
 
+    def _should_include_aux_features(self) -> bool:
+        if self.config.include_aux_features is not None:
+            return self.config.include_aux_features
+        return bool(self.config.model_config.use_noise_branch)
+
     @staticmethod
-    def _collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def _collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         images = torch.stack([item["image"].float() for item in batch])
+        collated: Dict[str, Any] = {"image": images}
+
         masks = []
         for item in batch:
             mask = item.get("mask")
@@ -143,16 +214,119 @@ class Trainer:
                 if mask.ndim == 2:
                     mask = mask.unsqueeze(0)
             masks.append(mask)
-        return {"image": images, "mask": torch.stack(masks)}
+        collated["mask"] = torch.stack(masks)
 
-    def _prepare_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        for key in ("high_pass", "residual"):
+            if all(key in item for item in batch):
+                collated[key] = torch.stack([item[key].float() for item in batch])
+
+        if all("label" in item for item in batch):
+            collated["label"] = torch.stack([item["label"].long() for item in batch])
+
+        if all("meta" in item for item in batch):
+            collated["meta"] = [item["meta"] for item in batch]
+
+        return collated
+
+    def _prepare_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        prepared: Dict[str, Any] = {}
+        for key, value in batch.items():
+            if torch.is_tensor(value):
+                prepared[key] = value.to(self.device, non_blocking=True)
+            else:
+                prepared[key] = value
+        return prepared
 
     def _autocast(self):
         return self._autocast_factory(self.scaler.is_enabled())
 
+    def _extract_noise_inputs(self, batch: Dict[str, Any]) -> Optional[Dict[str, torch.Tensor]]:
+        if not self.config.model_config.use_noise_branch:
+            return None
+        noise: Dict[str, torch.Tensor] = {}
+        for key in ("residual", "high_pass"):
+            tensor = batch.get(key)
+            if torch.is_tensor(tensor):
+                noise[key] = tensor
+        return noise or None
+
+    def _build_loss_fn(self) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        loss_type = (self.config.loss_type or "bce").lower()
+        dice_loss = SoftDiceLoss(smooth=self.config.dice_smooth)
+
+        def bce_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            pos_weight = self._get_pos_weight_tensor(logits)
+            return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+
+        if loss_type == "dice":
+            return lambda logits, targets: dice_loss(logits, targets)
+        if loss_type == "focal":
+            focal = FocalLoss(
+                gamma=self.config.focal_gamma,
+                alpha=self.config.focal_alpha,
+                pos_weight=self.config.pos_weight,
+            )
+
+            def focal_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+                return focal(logits, targets)
+
+            return focal_loss
+        if loss_type == "bce_dice":
+            bce_weight = self.config.bce_weight
+            dice_weight = self.config.dice_weight
+            denom = bce_weight + dice_weight
+            bce_scale = bce_weight / denom if denom > 0 else 0.5
+            dice_scale = dice_weight / denom if denom > 0 else 0.5
+
+            def combined_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+                return bce_scale * bce_loss(logits, targets) + dice_scale * dice_loss(logits, targets)
+
+            return combined_loss
+        return bce_loss
+
+    def _get_pos_weight_tensor(self, reference: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.config.pos_weight is None:
+            return None
+        return torch.tensor(
+            self.config.pos_weight,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    def _build_scheduler(self):
+        sched_type = (self.config.lr_scheduler_type or "").lower()
+        if sched_type == "plateau":
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                factor=self.config.lr_scheduler_factor,
+                patience=self.config.lr_scheduler_patience,
+                verbose=True,
+            )
+        if sched_type == "cosine":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.config.num_epochs,
+            )
+        return None
+
+    def _step_scheduler(self, metric: float) -> None:
+        if not self.scheduler:
+            return
+        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            self.scheduler.step(metric)
+        else:
+            self.scheduler.step()
+
     def train(self) -> Dict[str, List[float]]:
-        history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_dice": [], "val_iou": []}
+        history: Dict[str, List[float]] = {
+            "train_loss": [],
+            "val_loss": [],
+            "val_dice": [],
+            "val_iou": [],
+            "val_precision": [],
+            "val_recall": [],
+            "val_f1": [],
+        }
         if self.start_epoch > self.config.num_epochs:
             print(
                 f"Start epoch ({self.start_epoch}) exceeds configured num_epochs ({self.config.num_epochs}); "
@@ -164,15 +338,45 @@ class Trainer:
             train_loss = self._run_epoch(epoch)
             history["train_loss"].append(train_loss)
 
-            val_metrics = {"loss": float("nan"), "dice": float("nan"), "iou": float("nan")}
+            val_metrics = {
+                "loss": float("nan"),
+                "dice": float("nan"),
+                "iou": float("nan"),
+                "precision": float("nan"),
+                "recall": float("nan"),
+                "f1": float("nan"),
+            }
             if self.val_loader is not None:
                 val_metrics = self._run_validation()
                 history["val_loss"].append(val_metrics["loss"])
                 history["val_dice"].append(val_metrics["dice"])
                 history["val_iou"].append(val_metrics["iou"])
+                history["val_precision"].append(val_metrics["precision"])
+                history["val_recall"].append(val_metrics["recall"])
+                history["val_f1"].append(val_metrics["f1"])
+
+                primary_metrics = val_metrics.get("thresholds", {}).get(self.primary_threshold, {})
+                best_summary = val_metrics.get("best_threshold", {})
+                if primary_metrics:
+                    best_thr_val = best_summary.get("value")
+                    best_thr_fmt = f"{best_thr_val:.2f}" if isinstance(best_thr_val, (float, int)) else "n/a"
+                    best_f1_val = best_summary.get("f1")
+                    best_f1_fmt = f"{best_f1_val:.4f}" if isinstance(best_f1_val, (float, int)) else "n/a"
+                    print(
+                        f"Epoch {epoch} [val] loss={val_metrics['loss']:.4f} "
+                        f"dice@{self.primary_threshold:.2f}={primary_metrics.get('dice', float('nan')):.4f} "
+                        f"precision={primary_metrics.get('precision', float('nan')):.4f} "
+                        f"recall={primary_metrics.get('recall', float('nan')):.4f} "
+                        f"best_thr={best_thr_fmt} best_f1={best_f1_fmt}"
+                    )
 
             if epoch % self.config.checkpoint_interval == 0:
                 self._save_checkpoint(epoch, val_metrics)
+
+            scheduler_metric = val_metrics.get("loss", train_loss)
+            if math.isnan(scheduler_metric):
+                scheduler_metric = train_loss
+            self._step_scheduler(scheduler_metric)
         return history
 
     def _run_epoch(self, epoch: int) -> float:
@@ -189,8 +393,9 @@ class Trainer:
         for step, batch in enumerate(iterator, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
+            noise_inputs = self._extract_noise_inputs(batch)
             with self._autocast():
-                logits = self.model(images)
+                logits = self.model(images, noise_features=noise_inputs)
                 if logits.shape[-2:] != masks.shape[-2:]:
                     logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
                 loss = self.criterion(logits, masks)
@@ -225,41 +430,56 @@ class Trainer:
     @torch.inference_mode()
     def _run_validation(self) -> Dict[str, float]:
         if self.val_loader is None:
-            return {"loss": float("nan"), "dice": float("nan"), "iou": float("nan")}
+            return {
+                "loss": float("nan"),
+                "dice": float("nan"),
+                "iou": float("nan"),
+                "precision": float("nan"),
+                "recall": float("nan"),
+                "f1": float("nan"),
+                "thresholds": {},
+                "best_threshold": {},
+            }
         self.model.eval()
         total_loss = 0.0
-        total_dice = 0.0
-        total_iou = 0.0
         steps = 0
         max_val_batches = self.config.max_val_batches
+        threshold_stats = self._init_threshold_accumulators()
         for batch_idx, batch in enumerate(self.val_loader, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
+            noise_inputs = self._extract_noise_inputs(batch)
             with self._autocast():
-                logits = self.model(images)
+                logits = self.model(images, noise_features=noise_inputs)
             if logits.shape[-2:] != masks.shape[-2:]:
                 logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
             loss = self.criterion(logits, masks)
-            dice, iou = self._compute_segmentation_metrics(logits, masks)
+            probs = torch.sigmoid(logits)
+            self._update_threshold_stats(probs, masks, threshold_stats)
 
             total_loss += loss.item()
-            total_dice += dice
-            total_iou += iou
             steps += 1
             if max_val_batches is not None and batch_idx >= max_val_batches:
                 break
-        return {"loss": total_loss / steps, "dice": total_dice / steps, "iou": total_iou / steps}
-
-    @staticmethod
-    def _compute_segmentation_metrics(logits: torch.Tensor, targets: torch.Tensor) -> tuple[float, float]:
-        probs = torch.sigmoid(logits)
-        preds = (probs > 0.5).float()
-        eps = 1e-6
-        intersection = (preds * targets).sum(dim=(1, 2, 3))
-        union = preds.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3)) - intersection
-        dice = (2 * intersection + eps) / (preds.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3)) + eps)
-        iou = (intersection + eps) / (union + eps)
-        return dice.mean().item(), iou.mean().item()
+        avg_loss = total_loss / steps if steps else float("nan")
+        metrics_by_threshold, best_summary = self._finalize_threshold_metrics(threshold_stats)
+        primary_metrics = metrics_by_threshold.get(self.primary_threshold, {})
+        result = {
+            "loss": avg_loss,
+            "thresholds": metrics_by_threshold,
+            "best_threshold": best_summary,
+        }
+        if primary_metrics:
+            result.update(
+                {
+                    "dice": primary_metrics.get("dice", float("nan")),
+                    "iou": primary_metrics.get("iou", float("nan")),
+                    "precision": primary_metrics.get("precision", float("nan")),
+                    "recall": primary_metrics.get("recall", float("nan")),
+                    "f1": primary_metrics.get("f1", float("nan")),
+                }
+            )
+        return result
 
     def _save_checkpoint(self, epoch: int, val_metrics: Dict[str, float]) -> None:
         checkpoint = {
@@ -304,6 +524,68 @@ class Trainer:
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
                     state[key] = value.to(self.device)
+
+    def _init_threshold_accumulators(self) -> Dict[float, Dict[str, float]]:
+        return {
+            float(thr): {"tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0}
+            for thr in self.eval_thresholds
+        }
+
+    def _update_threshold_stats(
+        self,
+        probs: torch.Tensor,
+        targets: torch.Tensor,
+        accumulators: Dict[float, Dict[str, float]],
+    ) -> None:
+        targets_bin = (targets > 0.5).float()
+        inv_targets = 1.0 - targets_bin
+        for threshold, stats in accumulators.items():
+            preds = (probs > threshold).float()
+            inv_preds = 1.0 - preds
+            tp = (preds * targets_bin).sum().double().item()
+            fp = (preds * inv_targets).sum().double().item()
+            fn = (inv_preds * targets_bin).sum().double().item()
+            tn = (inv_preds * inv_targets).sum().double().item()
+            stats["tp"] += tp
+            stats["fp"] += fp
+            stats["fn"] += fn
+            stats["tn"] += tn
+
+    def _finalize_threshold_metrics(
+        self, accumulators: Dict[float, Dict[str, float]]
+    ) -> tuple[Dict[float, Dict[str, float | Dict[str, float]]], Dict[str, float | Dict[str, float]]]:
+        eps = 1e-8
+        metrics_by_threshold: Dict[float, Dict[str, float]] = {}
+        best_threshold = None
+        best_f1 = -math.inf
+        for threshold, stats in accumulators.items():
+            tp = stats["tp"]
+            fp = stats["fp"]
+            fn = stats["fn"]
+            tn = stats["tn"]
+            support = tp + fp + fn + tn
+            precision = tp / (tp + fp + eps) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn + eps) if (tp + fn) > 0 else 0.0
+            dice = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+            iou = (tp + eps) / (tp + fp + fn + eps)
+            f1 = (2 * precision * recall / (precision + recall + eps)) if (precision + recall) > 0 else 0.0
+            accuracy = (tp + tn) / support if support > 0 else 0.0
+            metrics_by_threshold[threshold] = {
+                "dice": dice,
+                "iou": iou,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "accuracy": accuracy,
+                "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+            }
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+        best_summary: Dict[str, float] = {"value": best_threshold if best_threshold is not None else float("nan")}
+        if best_threshold is not None:
+            best_summary.update(metrics_by_threshold[best_threshold])
+        return metrics_by_threshold, best_summary
 
 
 def run_training(config: TrainConfig) -> Dict[str, List[float]]:

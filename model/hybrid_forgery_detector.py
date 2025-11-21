@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from backbones.efficientnet_b0 import EfficientNetB0Backbone
+from backbones.residual_noise_branch import ResidualNoiseBackbone
 from backbones.segformer_mit import SegFormerMiTBackbone
 from backbones.swin_transformer import SwinTinyBackbone
 from decoder.unet_decoder import UNetDecoder
@@ -25,6 +26,11 @@ class HybridForgeryConfig:
     use_skip_connections: bool = True
     pretrained_backbones: bool = True
     fused_channels: int = 256
+    use_noise_branch: bool = True
+    noise_branch_base_channels: int = 32
+    noise_branch_num_stages: int = 4
+    noise_branch_use_residual: bool = True
+    noise_branch_use_high_pass: bool = True
 
 
 class HybridForgeryDetector(nn.Module):
@@ -61,6 +67,24 @@ class HybridForgeryDetector(nn.Module):
             self.backbones["segformer"] = segformer
             backbone_channels["segformer"] = segformer.feature_dims
 
+        self.noise_branch: ResidualNoiseBackbone | None = None
+        self._noise_residual_channels = 3 if self.config.noise_branch_use_residual else 0
+        self._noise_high_pass_channels = 3 if self.config.noise_branch_use_high_pass else 0
+        noise_in_channels = self._noise_residual_channels + self._noise_high_pass_channels
+        if self.config.use_noise_branch:
+            if noise_in_channels == 0:
+                raise ValueError("Noise branch enabled but no residual/high-pass inputs selected in config.")
+            if backbone_channels:
+                num_stages = len(next(iter(backbone_channels.values())))
+            else:
+                num_stages = self.config.noise_branch_num_stages
+            self.noise_branch = ResidualNoiseBackbone(
+                in_channels=noise_in_channels,
+                base_channels=self.config.noise_branch_base_channels,
+                num_stages=num_stages,
+            )
+            backbone_channels["noise"] = self.noise_branch.feature_dims
+
         if not backbone_channels:
             raise ValueError("At least one backbone must be enabled in the config.")
 
@@ -88,8 +112,16 @@ class HybridForgeryDetector(nn.Module):
             feature_dict[name] = backbone(x)
         return feature_dict
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        noise_features: Dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         pyramid_features = self._extract_features(x)
+        if self.noise_branch is not None:
+            residual, high_pass = self._resolve_noise_inputs(x, noise_features)
+            noise_pyramid = self.noise_branch(residual=residual, high_pass=high_pass)
+            pyramid_features["noise"] = noise_pyramid
         fused = self.fusion(pyramid_features)
         if self.decoder is not None:
             mask_logits = self.decoder(fused)
@@ -102,9 +134,45 @@ class HybridForgeryDetector(nn.Module):
         return mask_logits
 
     @torch.inference_mode()
-    def predict_mask(self, x: torch.Tensor, threshold: float | None = None) -> torch.Tensor:
-        logits = self.forward(x)
+    def predict_mask(
+        self,
+        x: torch.Tensor,
+        threshold: float | None = None,
+        noise_features: Dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        logits = self.forward(x, noise_features=noise_features)
         probs = torch.sigmoid(logits)
         if threshold is None:
             return probs
         return (probs > threshold).float()
+
+    def _resolve_noise_inputs(
+        self,
+        image: torch.Tensor,
+        noise_features: Dict[str, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        residual = None
+        high_pass = None
+        if self._noise_residual_channels > 0:
+            residual = (noise_features or {}).get("residual")
+            if residual is None:
+                residual = torch.zeros(
+                    image.shape[0],
+                    self._noise_residual_channels,
+                    image.shape[-2],
+                    image.shape[-1],
+                    device=image.device,
+                    dtype=image.dtype,
+                )
+        if self._noise_high_pass_channels > 0:
+            high_pass = (noise_features or {}).get("high_pass")
+            if high_pass is None:
+                high_pass = torch.zeros(
+                    image.shape[0],
+                    self._noise_high_pass_channels,
+                    image.shape[-2],
+                    image.shape[-1],
+                    device=image.device,
+                    dtype=image.dtype,
+                )
+        return residual, high_pass

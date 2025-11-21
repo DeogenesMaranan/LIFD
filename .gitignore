@@ -2,3 +2,5 @@ prepared/*
 datasets/*
 checkpoints/*
 __pycache__/*
+backbones/__pycache__/*
+models/__pycache__/*
