@@ -9,8 +9,10 @@ is performed once up front so the training loop can stream tensors quickly.
 from __future__ import annotations
 import json
 import math
+import os
 import random
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -92,6 +94,10 @@ class PreparationConfig:
     compute_high_pass: bool = True
     gaussian_radius: float = 1.0
     store_uint8_copy: bool = False
+    storage_dtype: np.dtype | str = np.float16
+
+    def __post_init__(self) -> None:
+        self.storage_dtype = np.dtype(self.storage_dtype)
 
     def normalize(self, array_uint8: np.ndarray) -> np.ndarray:
         array = array_uint8.astype(np.float32)
@@ -100,6 +106,11 @@ class PreparationConfig:
         if self.normalization_mode == "minus_one_one":
             return (array / 127.5) - 1.0
         raise ValueError("Unsupported normalization_mode. Use 'zero_one' or 'minus_one_one'.")
+
+    def cast_for_storage(self, array: np.ndarray) -> np.ndarray:
+        if array.dtype == self.storage_dtype:
+            return array
+        return array.astype(self.storage_dtype)
 
 
 @dataclass
@@ -113,14 +124,20 @@ class DataPreparationPipeline:
     def __init__(self, structure: DatasetStructureConfig,
                  split: SplitConfig | None = None,
                  prep: PreparationConfig | None = None,
-                 augment: AugmentationConfig | None = None) -> None:
+                 augment: AugmentationConfig | None = None,
+                 max_workers: Optional[int] = None) -> None:
         self.structure = structure
         self.split = split or SplitConfig()
         self.prep = prep or PreparationConfig()
         self.augment = augment or AugmentationConfig()
         self.split.validate()
+        cpu_count = os.cpu_count() or 1
+        if max_workers is None:
+            self.max_workers = cpu_count
+        else:
+            self.max_workers = max(1, min(max_workers, cpu_count))
         self._rng = random.Random(self.split.seed)
-        self._aug_rng = random.Random(self.split.seed + 1234)
+        self._aug_seed_base = self.split.seed + 1234
         self._prepared_root = self.structure.prepared_path()
         self._prepared_root.mkdir(parents=True, exist_ok=True)
         self._sample_counter = 0
@@ -136,27 +153,58 @@ class DataPreparationPipeline:
         total_samples = sum(len(samples) for samples in split_map.values())
         progress = tqdm(total=total_samples, desc="Preparing samples", unit="sample") if tqdm else None
 
+        executor = ThreadPoolExecutor(max_workers=self.max_workers) if self.max_workers > 1 else None
+
         try:
             for split_name, samples in split_map.items():
-                for sample in samples:
-                    self._sample_counter += 1
-                    self._log_sample_progress(split_name, sample)
-                    try:
-                        generated_files = self._process_sample(sample, split_name)
-                    except Exception as exc:  # pragma: no cover - runtime diagnostic aid
+                if not samples:
+                    continue
+                if executor is None:
+                    for sample in samples:
+                        self._sample_counter += 1
+                        seed = self._aug_seed_base + self._sample_counter
+                        self._log_sample_progress(split_name, sample)
+                        try:
+                            generated_files = self._process_sample(sample, split_name, seed)
+                        except Exception as exc:  # pragma: no cover - runtime diagnostic aid
+                            if progress:
+                                progress.close()
+                            context = (
+                                f"Failed while processing '{sample.image_path}'"
+                                f" (label={sample.label}, split={split_name}).")
+                            traceback.print_exc()
+                            raise RuntimeError(context) from exc
+                        manifest[split_name].extend(generated_files)
                         if progress:
-                            progress.close()
-                        context = (
-                            f"Failed while processing '{sample.image_path}'"
-                            f" (label={sample.label}, split={split_name}).")
-                        traceback.print_exc()
-                        raise RuntimeError(context) from exc
-                    manifest[split_name].extend(generated_files)
-                    if progress:
-                        progress.update(1)
+                            progress.update(1)
+                else:
+                    future_map = {}
+                    for sample in samples:
+                        self._sample_counter += 1
+                        seed = self._aug_seed_base + self._sample_counter
+                        self._log_sample_progress(split_name, sample)
+                        future = executor.submit(self._process_sample, sample, split_name, seed)
+                        future_map[future] = sample
+                    for future in as_completed(future_map):
+                        sample = future_map[future]
+                        try:
+                            generated_files = future.result()
+                        except Exception as exc:  # pragma: no cover - runtime diagnostic aid
+                            if progress:
+                                progress.close()
+                            context = (
+                                f"Failed while processing '{sample.image_path}'"
+                                f" (label={sample.label}, split={split_name}).")
+                            traceback.print_exc()
+                            raise RuntimeError(context) from exc
+                        manifest[split_name].extend(generated_files)
+                        if progress:
+                            progress.update(1)
         finally:
             if progress:
                 progress.close()
+            if executor:
+                executor.shutdown(wait=True)
 
         manifest_path = self._prepared_root / "manifest.json"
         with manifest_path.open("w", encoding="utf-8") as f:
@@ -251,12 +299,13 @@ class DataPreparationPipeline:
             split_map["test"].extend(test_split)
         return split_map
 
-    def _process_sample(self, sample: SampleRecord, split_name: str) -> List[str]:
+    def _process_sample(self, sample: SampleRecord, split_name: str,
+                        rng_seed: Optional[int] = None) -> List[str]:
         generated: List[str] = []
         base_image = self._load_image(sample.image_path, mode="RGB")
         mask_image = self._load_image(sample.mask_path, mode="L") if sample.mask_path else None
 
-        variants = self._apply_augmentations(base_image, mask_image)
+        variants = self._apply_augmentations(base_image, mask_image, rng_seed)
         for variant_idx, (variant_image, variant_mask, variant_tag) in enumerate(variants):
             generated.extend(self._save_all_resolutions(
                 variant_image, variant_mask, sample, split_name, variant_idx, variant_tag))
@@ -282,19 +331,20 @@ class DataPreparationPipeline:
         image_uint8 = np.array(image, dtype=np.uint8)
         image_float = self.prep.normalize(image_uint8).astype(np.float32)
 
-        arrays: Dict[str, Any] = {"image": image_float}
+        arrays: Dict[str, Any] = {"image": self.prep.cast_for_storage(image_float)}
         if self.prep.store_uint8_copy:
             arrays["image_uint8"] = image_uint8
 
         if mask is not None:
             mask_arr = np.array(mask, dtype=np.uint8)
             mask_arr = mask_arr[:, :, None] if mask_arr.ndim == 2 else mask_arr
-            arrays["mask"] = (mask_arr.astype(np.float32) / 255.0)
+            mask_float = (mask_arr.astype(np.float32) / 255.0)
+            arrays["mask"] = self.prep.cast_for_storage(mask_float)
 
         if self.prep.compute_high_pass:
             high_pass, residual = self._compute_high_pass_features(image_uint8)
-            arrays["high_pass"] = high_pass
-            arrays["residual"] = residual
+            arrays["high_pass"] = self.prep.cast_for_storage(high_pass)
+            arrays["residual"] = self.prep.cast_for_storage(residual)
 
         meta = {
             "label": sample.label,
@@ -331,30 +381,33 @@ class DataPreparationPipeline:
         residual = residual / 255.0
         return high_pass.astype(np.float32), residual.astype(np.float32)
 
-    def _apply_augmentations(self, image: Image.Image, mask: Optional[Image.Image]) -> List[Tuple[Image.Image, Optional[Image.Image], str]]:
+    def _apply_augmentations(self, image: Image.Image, mask: Optional[Image.Image],
+                              rng_seed: Optional[int]) -> List[Tuple[Image.Image, Optional[Image.Image], str]]:
         variants: List[Tuple[Image.Image, Optional[Image.Image], str]] = [(image.copy(), mask.copy() if mask else None, "orig")]
         if not self.augment.enable:
             return variants
+
+        rng = random.Random(rng_seed if rng_seed is not None else self._aug_seed_base)
 
         for idx in range(self.augment.copies_per_sample):
             aug_img = image.copy()
             aug_mask = mask.copy() if mask else None
             tag_parts: List[str] = []
 
-            if self.augment.enable_flips and self._aug_rng.random() < 0.5:
+            if self.augment.enable_flips and rng.random() < 0.5:
                 aug_img = ImageOps.mirror(aug_img)
                 if aug_mask:
                     aug_mask = ImageOps.mirror(aug_mask)
                 tag_parts.append("hflip")
 
-            if self.augment.enable_flips and self._aug_rng.random() < 0.2:
+            if self.augment.enable_flips and rng.random() < 0.2:
                 aug_img = ImageOps.flip(aug_img)
                 if aug_mask:
                     aug_mask = ImageOps.flip(aug_mask)
                 tag_parts.append("vflip")
 
             if self.augment.enable_rotations and self.augment.max_rotation_degrees > 0:
-                angle = self._aug_rng.uniform(-self.augment.max_rotation_degrees, self.augment.max_rotation_degrees)
+                angle = rng.uniform(-self.augment.max_rotation_degrees, self.augment.max_rotation_degrees)
                 if abs(angle) > 1e-3:
                     aug_img = aug_img.rotate(angle, resample=RESAMPLE_BICUBIC, expand=False, fillcolor=0)
                     if aug_mask:
@@ -362,16 +415,16 @@ class DataPreparationPipeline:
                     tag_parts.append(f"rot{int(angle)}")
 
             if self.augment.enable_random_crop:
-                aug_img, aug_mask, cropped = self._random_crop(aug_img, aug_mask, self.augment.crop_scale_range)
+                aug_img, aug_mask, cropped = self._random_crop(aug_img, aug_mask, self.augment.crop_scale_range, rng)
                 if cropped:
                     tag_parts.append("crop")
 
             if self.augment.enable_color_jitter:
-                aug_img = self._color_jitter(aug_img)
+                aug_img = self._color_jitter(aug_img, rng)
                 tag_parts.append("jitter")
 
             if self.augment.enable_noise:
-                aug_img = self._add_noise(aug_img)
+                aug_img = self._add_noise(aug_img, rng)
                 tag_parts.append("noise")
 
             variant_tag = "aug" + str(idx + 1)
@@ -381,13 +434,13 @@ class DataPreparationPipeline:
         return variants
 
     def _random_crop(self, image: Image.Image, mask: Optional[Image.Image],
-                     scale_range: Tuple[float, float]) -> Tuple[Image.Image, Optional[Image.Image], bool]:
+                     scale_range: Tuple[float, float], rng: random.Random) -> Tuple[Image.Image, Optional[Image.Image], bool]:
         min_scale, max_scale = scale_range
         min_scale = max(0.1, min_scale)
         max_scale = min(1.0, max_scale)
         if min_scale >= max_scale:
             return image, mask, False
-        scale = self._aug_rng.uniform(min_scale, max_scale)
+        scale = rng.uniform(min_scale, max_scale)
         if math.isclose(scale, 1.0, rel_tol=1e-3):
             return image, mask, False
         w, h = image.size
@@ -397,31 +450,31 @@ class DataPreparationPipeline:
             return image, mask, False
         max_left = w - crop_w
         max_top = h - crop_h
-        left = self._aug_rng.randint(0, max(0, max_left))
-        top = self._aug_rng.randint(0, max(0, max_top))
+        left = rng.randint(0, max(0, max_left))
+        top = rng.randint(0, max(0, max_top))
         box = (left, top, left + crop_w, top + crop_h)
         cropped_image = image.crop(box)
         cropped_mask = mask.crop(box) if mask else None
         return cropped_image, cropped_mask, True
 
-    def _color_jitter(self, image: Image.Image) -> Image.Image:
+    def _color_jitter(self, image: Image.Image, rng: random.Random) -> Image.Image:
         factor_range = self.augment.color_jitter_factors
         brightness = ImageEnhance.Brightness(image).enhance(
-            self._aug_rng.uniform(*factor_range))
+            rng.uniform(*factor_range))
         contrast = ImageEnhance.Contrast(brightness).enhance(
-            self._aug_rng.uniform(*factor_range))
+            rng.uniform(*factor_range))
         colorized = ImageEnhance.Color(contrast).enhance(
-            self._aug_rng.uniform(*factor_range))
+            rng.uniform(*factor_range))
         return colorized
 
-    def _add_noise(self, image: Image.Image) -> Image.Image:
+    def _add_noise(self, image: Image.Image, rng: random.Random) -> Image.Image:
         std_min, std_max = self.augment.noise_std_range
-        std = self._aug_rng.uniform(std_min, std_max)
+        std = rng.uniform(std_min, std_max)
         if std <= 0:
             return image
         arr = np.array(image, dtype=np.float32)
-        rng = np.random.default_rng(self._aug_rng.randrange(0, 2**32 - 1))
-        noise = rng.normal(0.0, std * 255.0, size=arr.shape)
+        np_rng = np.random.default_rng(rng.randrange(0, 2**32 - 1))
+        noise = np_rng.normal(0.0, std * 255.0, size=arr.shape)
         noised = np.clip(arr + noise, 0, 255).astype(np.uint8)
         return Image.fromarray(noised)
 
@@ -446,16 +499,16 @@ class PreparedForgeryDataset(TorchDataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         path = self.files[index]
         with np.load(path, allow_pickle=True) as data:
-            image = torch.from_numpy(data["image"].transpose(2, 0, 1))
+            image = torch.from_numpy(data["image"].transpose(2, 0, 1)).float()
             sample: Dict[str, Any] = {"image": image}
             if self.return_masks and "mask" in data.files:
-                mask = torch.from_numpy(data["mask"].transpose(2, 0, 1))
+                mask = torch.from_numpy(data["mask"].transpose(2, 0, 1)).float()
                 sample["mask"] = mask
             if self.include_features:
                 if "high_pass" in data.files and data["high_pass"].size:
-                    sample["high_pass"] = torch.from_numpy(data["high_pass"].transpose(2, 0, 1))
+                    sample["high_pass"] = torch.from_numpy(data["high_pass"].transpose(2, 0, 1)).float()
                 if "residual" in data.files and data["residual"].size:
-                    sample["residual"] = torch.from_numpy(data["residual"].transpose(2, 0, 1))
+                    sample["residual"] = torch.from_numpy(data["residual"].transpose(2, 0, 1)).float()
             meta = json.loads(str(data["meta"].item())) if "meta" in data.files else {}
             sample["label"] = torch.tensor(1 if meta.get("label") == "fake" else 0)
             sample["meta"] = meta
