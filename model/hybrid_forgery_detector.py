@@ -6,6 +6,7 @@ from typing import Dict, List
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from backbones.efficientnet_b0 import EfficientNetB0Backbone
 from backbones.residual_noise_branch import ResidualNoiseBackbone
@@ -34,6 +35,7 @@ class HybridForgeryConfig:
     use_boundary_refiner: bool = True
     boundary_refiner_channels: int = 64
     backbone_input_size: int | tuple[int, int] = 384
+    gradient_checkpointing: bool = False
 
 
 class HybridForgeryDetector(nn.Module):
@@ -128,8 +130,21 @@ class HybridForgeryDetector(nn.Module):
 
     def _extract_features(self, x: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
         feature_dict: Dict[str, List[torch.Tensor]] = {}
+        use_checkpoint = self.config.gradient_checkpointing and torch.is_grad_enabled()
         for name, backbone in self.backbones.items():
-            feature_dict[name] = backbone(x)
+            if use_checkpoint:
+                # Checkpointing trades a little compute for a sizable activation memory drop.
+                def _forward_module(inp: torch.Tensor, module=backbone):
+                    outputs = module(inp)
+                    return tuple(outputs)
+
+                try:
+                    features = checkpoint(_forward_module, x, use_reentrant=False)
+                except TypeError:
+                    features = checkpoint(_forward_module, x)
+                feature_dict[name] = [feat for feat in features]
+            else:
+                feature_dict[name] = backbone(x)
         return feature_dict
 
     def forward(
