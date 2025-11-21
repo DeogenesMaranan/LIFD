@@ -19,6 +19,11 @@ try:
 except ImportError:
     tqdm = None
 
+if torch.cuda.is_available():  # Enable hardware-specific speed-ups when possible
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 
 @dataclass
 class TrainConfig:
@@ -37,6 +42,10 @@ class TrainConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 1e-2
     num_workers: int = 4
+    prefetch_factor: Optional[int] = 4
+    persistent_workers: bool = True
+    pin_memory: Optional[bool] = None
+    grad_accumulation_steps: int = 1
     device: Optional[str] = None
     grad_clip_norm: Optional[float] = 1.0
     log_interval: int = 10
@@ -87,14 +96,23 @@ class Trainer:
             include_features=False,
             return_masks=True,
         )
-        return DataLoader(
-            dataset,
+        pin_memory = self.config.pin_memory
+        if pin_memory is None:
+            pin_memory = self.device.type == "cuda"
+
+        loader_kwargs = dict(
             batch_size=self.config.batch_size,
             shuffle=shuffle,
             num_workers=self.config.num_workers,
-            pin_memory=self.device.type == "cuda",
+            pin_memory=pin_memory,
             collate_fn=self._collate_batch,
         )
+        if self.config.num_workers > 0:
+            loader_kwargs["persistent_workers"] = self.config.persistent_workers
+            if self.config.prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = self.config.prefetch_factor
+
+        return DataLoader(dataset, **loader_kwargs)
 
     @staticmethod
     def _collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -146,30 +164,41 @@ class Trainer:
         if tqdm:
             iterator = tqdm(iterator, desc=f"Epoch {epoch} [train]", leave=False)
         steps_completed = 0
+        accum_target = max(1, self.config.grad_accumulation_steps)
+        accum_counter = 0
+        self.optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(iterator, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
-            self.optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=self.scaler.is_enabled()):
                 logits = self.model(images)
                 if logits.shape[-2:] != masks.shape[-2:]:
                     logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
                 loss = self.criterion(logits, masks)
-            self.scaler.scale(loss).backward()
-            if self.config.grad_clip_norm is not None:
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
             running_loss += loss.item()
+
+            scaled_loss = loss / accum_target
+            self.scaler.scale(scaled_loss).backward()
+            accum_counter += 1
+
+            reached_cap = self.config.max_train_batches is not None and step >= self.config.max_train_batches
+            should_step = accum_counter == accum_target or step == total_steps or reached_cap
+            if should_step:
+                if self.config.grad_clip_norm is not None:
+                    self.scaler.unscale_(self.optimizer)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+                accum_counter = 0
+
             steps_completed = step
             if not tqdm and step % self.config.log_interval == 0:
                 print(
                     f"Epoch {epoch} | Step {step}/{total_steps} "
                     f"| Loss: {loss.item():.4f} | Avg: {running_loss / step:.4f}"
                 )
-            if self.config.max_train_batches is not None and step >= self.config.max_train_batches:
+            if reached_cap:
                 break
         steps_denominator = steps_completed if steps_completed > 0 else 1
         return running_loss / steps_denominator
