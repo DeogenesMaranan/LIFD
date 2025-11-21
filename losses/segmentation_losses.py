@@ -160,9 +160,11 @@ class CombinedSegmentationLoss(nn.Module):
 
     @staticmethod
     def _lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
-        gts = gt_sorted.sum(dim=1)
+        if gt_sorted.numel() == 0:
+            return gt_sorted
+        gts = gt_sorted.sum(dim=1, keepdim=True)
         intersection = gts - gt_sorted.cumsum(dim=1)
         union = gts + (1 - gt_sorted).cumsum(dim=1)
-        jaccard = 1 - intersection / union.clamp_min(1)
-        jaccard = torch.cat([jaccard[:, :1], jaccard[:, 1:] - jaccard[:, :-1]], dim=1)
-        return jaccard
+        jaccard = 1 - intersection / union.clamp_min(1.0)
+        grads = torch.cat([jaccard[:, :1], jaccard[:, 1:] - jaccard[:, :-1]], dim=1)
+        return grads
