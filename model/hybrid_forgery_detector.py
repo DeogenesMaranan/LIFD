@@ -33,6 +33,7 @@ class HybridForgeryConfig:
     noise_branch_use_high_pass: bool = True
     use_boundary_refiner: bool = True
     boundary_refiner_channels: int = 64
+    backbone_input_size: int | tuple[int, int] = 384
 
 
 class HybridForgeryDetector(nn.Module):
@@ -60,7 +61,10 @@ class HybridForgeryDetector(nn.Module):
             backbone_channels["efficientnet"] = eff.feature_dims
 
         if self.config.use_swin:
-            swin = SwinTinyBackbone(pretrained=self.config.pretrained_backbones)
+            swin = SwinTinyBackbone(
+                pretrained=self.config.pretrained_backbones,
+                input_size=self.config.backbone_input_size,
+            )
             self.backbones["swin"] = swin
             backbone_channels["swin"] = swin.feature_dims
 
