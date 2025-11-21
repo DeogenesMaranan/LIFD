@@ -7,17 +7,20 @@ is performed once up front so the training loop can stream tensors quickly.
 """
 
 from __future__ import annotations
+import io
 import json
 import math
 import os
 import random
 import traceback
+import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 try:
     import imageio.v3 as iio
@@ -33,6 +36,7 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+MANIFEST_FILENAME = "manifest.parquet"
 
 try:
     RESAMPLE_BICUBIC = Image.Resampling.BICUBIC
@@ -143,10 +147,10 @@ class DataPreparationPipeline:
         self._sample_counter = 0
         self._last_sample_log = self._prepared_root / "last_sample.log"
 
-    def prepare(self) -> Dict[str, List[str]]:
+    def prepare(self) -> pd.DataFrame:
         samples_by_label = self._collect_samples()
         split_map = self._split_samples(samples_by_label)
-        manifest: Dict[str, List[str]] = {"train": [], "val": [], "test": []}
+        manifest_entries: List[Dict[str, Any]] = []
 
         print("Samples per split:", {k: len(v) for k, v in split_map.items()})
 
@@ -165,8 +169,8 @@ class DataPreparationPipeline:
                         seed = self._aug_seed_base + self._sample_counter
                         self._log_sample_progress(split_name, sample)
                         try:
-                            generated_files = self._process_sample(sample, split_name, seed)
-                        except Exception as exc:  # pragma: no cover - runtime diagnostic aid
+                            generated_entries = self._process_sample(sample, split_name, seed)
+                        except Exception as exc:
                             if progress:
                                 progress.close()
                             context = (
@@ -174,7 +178,7 @@ class DataPreparationPipeline:
                                 f" (label={sample.label}, split={split_name}).")
                             traceback.print_exc()
                             raise RuntimeError(context) from exc
-                        manifest[split_name].extend(generated_files)
+                        manifest_entries.extend(generated_entries)
                         if progress:
                             progress.update(1)
                 else:
@@ -188,8 +192,8 @@ class DataPreparationPipeline:
                     for future in as_completed(future_map):
                         sample = future_map[future]
                         try:
-                            generated_files = future.result()
-                        except Exception as exc:  # pragma: no cover - runtime diagnostic aid
+                            generated_entries = future.result()
+                        except Exception as exc:
                             if progress:
                                 progress.close()
                             context = (
@@ -197,7 +201,7 @@ class DataPreparationPipeline:
                                 f" (label={sample.label}, split={split_name}).")
                             traceback.print_exc()
                             raise RuntimeError(context) from exc
-                        manifest[split_name].extend(generated_files)
+                        manifest_entries.extend(generated_entries)
                         if progress:
                             progress.update(1)
         finally:
@@ -206,10 +210,59 @@ class DataPreparationPipeline:
             if executor:
                 executor.shutdown(wait=True)
 
-        manifest_path = self._prepared_root / "manifest.json"
-        with manifest_path.open("w", encoding="utf-8") as f:
-            json.dump({k: [str(p) for p in v] for k, v in manifest.items()}, f, indent=2)
-        return manifest
+        self._create_tar_shards(manifest_entries)
+
+        manifest_df = pd.DataFrame(manifest_entries)
+        manifest_path = self._prepared_root / MANIFEST_FILENAME
+        manifest_df.to_parquet(manifest_path, index=False)
+
+        split_counts = manifest_df.groupby("split").size().to_dict() if not manifest_df.empty else {}
+        print("Artifacts per split:", split_counts)
+
+        return manifest_df
+
+    # ----------------- TAR Sharding ----------------- #
+    def _create_tar_shards(self, manifest_entries: List[Dict[str, Any]], shard_size: int = 500) -> None:
+        if not manifest_entries:
+            print("No artifacts to shard.")
+            return
+
+        entry_by_rel_path = {
+            entry.get("relative_path"): entry
+            for entry in manifest_entries
+            if entry.get("relative_path")
+        }
+
+        print("Creating TAR shards...")
+        for split_name in ["train", "val", "test"]:
+            split_dir = self._prepared_root / split_name
+            if not split_dir.exists():
+                continue
+
+            for stale_tar in split_dir.glob("shard_*.tar"):
+                stale_tar.unlink()
+
+            npz_files = sorted(split_dir.rglob("*.npz"))
+            if not npz_files:
+                continue
+
+            shard_idx = 0
+            for i in range(0, len(npz_files), shard_size):
+                shard_files = npz_files[i:i + shard_size]
+                tar_path = split_dir / f"shard_{shard_idx:04d}.tar"
+                tar_rel_path = str(tar_path.relative_to(self._prepared_root))
+                with tarfile.open(tar_path, "w") as tar:
+                    for npz_file in shard_files:
+                        rel_path = str(npz_file.relative_to(self._prepared_root))
+                        tar.add(npz_file, arcname=npz_file.name)
+                        entry = entry_by_rel_path.get(rel_path)
+                        if entry is not None:
+                            entry["tar_path"] = tar_rel_path
+                            entry["tar_member"] = npz_file.name
+                        npz_file.unlink()
+                shard_idx += 1
+                print(f"{split_name}: created {tar_path} with {len(shard_files)} samples")
+        print("All TAR shards created.")
 
     # ----------------- Internal helper methods (unchanged) ----------------- #
     def _log_sample_progress(self, split_name: str, sample: SampleRecord) -> None:
@@ -224,15 +277,12 @@ class DataPreparationPipeline:
         self._last_sample_log.write_text(json.dumps(log_entry, indent=2))
 
     def _load_image(self, path: Optional[Path], mode: str) -> Optional[Image.Image]:
-        if path is None:
-            return None
-        if not path.exists():
+        if path is None or not path.exists():
             return None
         suffix = path.suffix.lower()
         use_safe_loader = suffix in {".tif", ".tiff"}
         if use_safe_loader and iio is None:
-            raise RuntimeError(
-                f"Cannot safely load TIFF '{path}'. Install imageio to enable TIFF fallback.")
+            raise RuntimeError(f"Cannot safely load TIFF '{path}'. Install imageio to enable TIFF fallback.")
         if use_safe_loader and iio is not None:
             array = iio.imread(path)
             if array.ndim == 2 and mode.upper() not in {"L", "LA"}:
@@ -240,6 +290,7 @@ class DataPreparationPipeline:
             return Image.fromarray(array).convert(mode)
         with Image.open(path) as image:
             return image.convert(mode)
+
     def _collect_samples(self) -> Dict[str, List[SampleRecord]]:
         dataset_path = self.structure.as_path()
         real_dir = dataset_path / self.structure.real_subdir
@@ -256,8 +307,7 @@ class DataPreparationPipeline:
             samples["fake"].append(SampleRecord(image_path=image_path, mask_path=mask_path, label="fake"))
 
         if not samples["real"] and not samples["fake"]:
-            raise FileNotFoundError(
-                f"No samples found beneath {dataset_path}. Check DatasetStructureConfig paths.")
+            raise FileNotFoundError(f"No samples found beneath {dataset_path}.")
         return samples
 
     def _iter_images(self, directory: Path) -> Iterator[Path]:
@@ -270,12 +320,9 @@ class DataPreparationPipeline:
     def _resolve_mask_path(self, mask_dir: Path, image_path: Path) -> Optional[Path]:
         if not mask_dir.exists():
             return None
-        candidates: List[Path] = []
         stem_with_suffix = image_path.stem + self.structure.mask_suffix
-        candidates.append(mask_dir / f"{stem_with_suffix}{image_path.suffix}")
-        for ext in IMG_EXTENSIONS:
-            candidates.append(mask_dir / f"{stem_with_suffix}{ext}")
-        for candidate in candidates:
+        for ext in [image_path.suffix] + list(IMG_EXTENSIONS):
+            candidate = mask_dir / f"{stem_with_suffix}{ext}"
             if candidate.exists():
                 return candidate
         return None
@@ -291,17 +338,14 @@ class DataPreparationPipeline:
             train_count = int(total * self.split.train)
             val_count = int(total * self.split.val)
             test_count = max(0, total - train_count - val_count)
-            train_split = shuffled[:train_count]
-            val_split = shuffled[train_count:train_count + val_count]
-            test_split = shuffled[train_count + val_count:train_count + val_count + test_count]
-            split_map["train"].extend(train_split)
-            split_map["val"].extend(val_split)
-            split_map["test"].extend(test_split)
+            split_map["train"].extend(shuffled[:train_count])
+            split_map["val"].extend(shuffled[train_count:train_count + val_count])
+            split_map["test"].extend(shuffled[train_count + val_count:train_count + val_count + test_count])
         return split_map
 
     def _process_sample(self, sample: SampleRecord, split_name: str,
-                        rng_seed: Optional[int] = None) -> List[str]:
-        generated: List[str] = []
+                        rng_seed: Optional[int] = None) -> List[Dict[str, Any]]:
+        generated: List[Dict[str, Any]] = []
         base_image = self._load_image(sample.image_path, mode="RGB")
         mask_image = self._load_image(sample.mask_path, mode="L") if sample.mask_path else None
 
@@ -313,21 +357,21 @@ class DataPreparationPipeline:
 
     def _save_all_resolutions(self, image: Image.Image, mask: Optional[Image.Image],
                               sample: SampleRecord, split_name: str,
-                              variant_idx: int, variant_tag: str) -> List[str]:
-        paths: List[str] = []
+                              variant_idx: int, variant_tag: str) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
         for target_size in self.prep.target_sizes:
             resized_image = ImageOps.fit(image, (target_size, target_size), method=RESAMPLE_BICUBIC)
             resized_mask = None
             if mask is not None:
                 resized_mask = ImageOps.fit(mask, (target_size, target_size), method=RESAMPLE_NEAREST)
-            saved_path = self._process_resolution(
+            entry = self._process_resolution(
                 resized_image, resized_mask, sample, split_name, target_size, variant_idx, variant_tag)
-            paths.append(str(saved_path))
-        return paths
+            entries.append(entry)
+        return entries
 
     def _process_resolution(self, image: Image.Image, mask: Optional[Image.Image],
                              sample: SampleRecord, split_name: str, target_size: int,
-                             variant_idx: int, variant_tag: str) -> Path:
+                             variant_idx: int, variant_tag: str) -> Dict[str, Any]:
         image_uint8 = np.array(image, dtype=np.uint8)
         image_float = self.prep.normalize(image_uint8).astype(np.float32)
 
@@ -360,7 +404,15 @@ class DataPreparationPipeline:
         output_path = self._build_output_path(split_name, sample, target_size, variant_tag)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(output_path, **arrays)
-        return output_path
+
+        entry = {
+            **meta,
+            "relative_path": str(output_path.relative_to(self._prepared_root)),
+            "tar_path": None,
+            "tar_member": output_path.name,
+            "storage_dtype": str(self.prep.storage_dtype),
+        }
+        return entry
 
     def _build_output_path(self, split_name: str, sample: SampleRecord,
                            target_size: int, variant_tag: str) -> Path:
@@ -485,20 +537,50 @@ class PreparedForgeryDataset(TorchDataset):
         self.prepared_root = Path(prepared_root)
         self.split = split
         self.target_size = target_size
-        pattern = f"*_{target_size}px_*.npz"
-        self.files = sorted((self.prepared_root / split).rglob(pattern))
-        if not self.files:
+        manifest_path = self.prepared_root / MANIFEST_FILENAME
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest file '{manifest_path}' not found.")
+
+        manifest_df = pd.read_parquet(manifest_path)
+        split_df = manifest_df[(manifest_df["split"] == split) &
+                               (manifest_df["target_size"] == target_size)].reset_index(drop=True)
+        if split_df.empty:
             raise FileNotFoundError(f"No preprocessed samples found for split='{split}', size={target_size}.")
+
+        self.records = split_df.to_dict("records")
         self.include_features = include_features
         self.return_masks = return_masks
+        self._tar_cache: Dict[str, tarfile.TarFile] = {}
+        self._manifest_df = split_df
         self.sample_labels = self._load_or_build_labels()
 
     def __len__(self) -> int:
-        return len(self.files)
+        return len(self.records)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        path = self.files[index]
-        with np.load(path, allow_pickle=True) as data:
+        record = self.records[index]
+
+        if record.get("tar_path"):
+            tar_path = self.prepared_root / record["tar_path"]
+            tar = self._get_tar_handle(tar_path)
+            member_name = record["tar_member"]
+            member = tar.extractfile(member_name)
+            if member is None:
+                raise FileNotFoundError(f"Member '{member_name}' not found inside '{tar_path}'.")
+            try:
+                npz_bytes = member.read()
+            finally:
+                member.close()
+            npz_stream = io.BytesIO(npz_bytes)
+            npz_source = np.load(npz_stream, allow_pickle=True)
+        else:
+            rel_path = record.get("relative_path")
+            if not rel_path:
+                raise FileNotFoundError("Record is missing both tar_path and relative_path.")
+            npz_path = self.prepared_root / rel_path
+            npz_source = np.load(npz_path, allow_pickle=True)
+
+        with npz_source as data:
             image = torch.from_numpy(data["image"].transpose(2, 0, 1)).float()
             sample: Dict[str, Any] = {"image": image}
             if self.return_masks and "mask" in data.files:
@@ -520,17 +602,28 @@ class PreparedForgeryDataset(TorchDataset):
         if cache_path.exists():
             return np.load(cache_path).astype(np.int8).tolist()
 
-        labels: List[int] = []
-        for path in self.files:
-            with np.load(path, allow_pickle=True) as data:
-                if "meta" in data.files:
-                    meta = json.loads(str(data["meta"].item()))
-                    label = 1 if meta.get("label") == "fake" else 0
-                else:
-                    label = 0
-            labels.append(label)
-        np.save(cache_path, np.asarray(labels, dtype=np.int8))
-        return labels
+        labels = np.asarray([1 if record.get("label") == "fake" else 0 for record in self.records], dtype=np.int8)
+        np.save(cache_path, labels)
+        return labels.tolist()
+
+    def _get_tar_handle(self, tar_path: Path) -> tarfile.TarFile:
+        key = str(tar_path.resolve())
+        handle = self._tar_cache.get(key)
+        if handle is None:
+            handle = tarfile.open(tar_path, "r")
+            self._tar_cache[key] = handle
+        return handle
+
+    def close(self) -> None:
+        for handle in self._tar_cache.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._tar_cache.clear()
+
+    def __del__(self) -> None:
+        self.close()
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -546,26 +639,16 @@ if __name__ == "__main__":
         prepared_root="prepared",
     )
 
-    split = SplitConfig(
-        train=0.7, 
-        val=0.15, 
-        test=0.15, 
-        seed=42)
+    split = SplitConfig(train=0.7, val=0.15, test=0.15, seed=42)
     
-    prep = PreparationConfig(
-        target_sizes=(384,), 
-        normalization_mode="zero_one", 
-        compute_high_pass=True)
+    prep = PreparationConfig(target_sizes=(384,), normalization_mode="zero_one", compute_high_pass=True)
     
-    augment = AugmentationConfig(
-        enable=True, 
-        copies_per_sample=2, 
-        max_rotation_degrees=15,
-        crop_scale_range=(0.8, 1.0), 
-        noise_std_range=(0.0, 0.03))
+    augment = AugmentationConfig(enable=True, copies_per_sample=2, max_rotation_degrees=15,
+                                 crop_scale_range=(0.8, 1.0), noise_std_range=(0.0, 0.03))
 
     pipeline = DataPreparationPipeline(structure, split, prep, augment)
-    manifest = pipeline.prepare()
+    manifest_df = pipeline.prepare()
     print("Preparation finished.")
-    for split_name, files in manifest.items():
-        print(f"{split_name}: {len(files)} artifacts")
+    if not manifest_df.empty:
+        for split_name, count in manifest_df.groupby("split").size().items():
+            print(f"{split_name}: {count} artifacts")
