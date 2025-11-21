@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch import amp
 from torch.utils.data import DataLoader
 
 from data.data_preparation import PreparedForgeryDataset
@@ -73,7 +73,11 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
-        self.scaler = GradScaler(enabled=config.use_amp and self.device.type == "cuda")
+        self._autocast_device_type = "cuda" if self.device.type == "cuda" else "cpu"
+        self.scaler = amp.GradScaler(
+            device_type=self._autocast_device_type,
+            enabled=config.use_amp and self.device.type == "cuda",
+        )
 
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -170,7 +174,7 @@ class Trainer:
         for step, batch in enumerate(iterator, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
-            with autocast(enabled=self.scaler.is_enabled()):
+            with amp.autocast(device_type=self._autocast_device_type, enabled=self.scaler.is_enabled()):
                 logits = self.model(images)
                 if logits.shape[-2:] != masks.shape[-2:]:
                     logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
@@ -216,7 +220,8 @@ class Trainer:
         for batch_idx, batch in enumerate(self.val_loader, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
-            logits = self.model(images)
+            with amp.autocast(device_type=self._autocast_device_type, enabled=self.scaler.is_enabled()):
+                logits = self.model(images)
             if logits.shape[-2:] != masks.shape[-2:]:
                 logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
             loss = self.criterion(logits, masks)
