@@ -300,7 +300,6 @@ class Trainer:
                 self.optimizer,
                 factor=self.config.lr_scheduler_factor,
                 patience=self.config.lr_scheduler_patience,
-                verbose=True,
             )
         if sched_type == "cosine":
             return torch.optim.lr_scheduler.CosineAnnealingLR(
