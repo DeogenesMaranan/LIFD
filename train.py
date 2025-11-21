@@ -4,16 +4,17 @@ import math
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import amp
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from data.data_preparation import PreparedForgeryDataset
 from model.hybrid_forgery_detector import HybridForgeryConfig, HybridForgeryDetector
+from losses.segmentation_losses import CombinedSegmentationLoss, LossConfig
 
 try:
     from tqdm.auto import tqdm
@@ -26,46 +27,6 @@ if torch.cuda.is_available():  # Enable hardware-specific speed-ups when possibl
     torch.backends.cudnn.allow_tf32 = True
 
 
-class SoftDiceLoss(nn.Module):
-    def __init__(self, smooth: float = 1.0) -> None:
-        super().__init__()
-        self.smooth = smooth
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        probs = torch.sigmoid(logits)
-        dims = (1, 2, 3)
-        intersection = (probs * targets).sum(dim=dims)
-        denom = probs.sum(dim=dims) + targets.sum(dim=dims)
-        dice = (2 * intersection + self.smooth) / (denom + self.smooth)
-        return 1.0 - dice.mean()
-
-
-class FocalLoss(nn.Module):
-    def __init__(
-        self,
-        gamma: float = 2.0,
-        alpha: Optional[float] = 0.25,
-        pos_weight: Optional[float] = None,
-    ) -> None:
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.register_buffer("_pos_weight", torch.tensor(pos_weight) if pos_weight is not None else None)
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        pos_weight = self._pos_weight
-        if pos_weight is not None and pos_weight.device != logits.device:
-            pos_weight = pos_weight.to(logits.device)
-        bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction="none")
-        probs = torch.sigmoid(logits)
-        probs_t = targets * probs + (1 - targets) * (1 - probs)
-        modulating = (1.0 - probs_t).clamp(min=0) ** self.gamma
-        if self.alpha is not None:
-            alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
-            modulating = modulating * alpha_t
-        return (modulating * bce).mean()
-
-
 @dataclass
 class TrainConfig:
     """Configuration bundle for launching training runs.
@@ -75,7 +36,7 @@ class TrainConfig:
     """
 
     prepared_root: str = "prepared/CASIA2"
-    target_size: int = 128
+    target_size: int = 384
     train_split: str = "train"
     val_split: str = "val"
     batch_size: int = 8
@@ -98,18 +59,16 @@ class TrainConfig:
     max_val_batches: Optional[int] = None
     resume_from: Optional[str] = None
     include_aux_features: Optional[bool] = None
-    loss_type: str = "bce_dice"
-    bce_weight: float = 0.7
-    dice_weight: float = 0.3
-    pos_weight: Optional[float] = None
-    dice_smooth: float = 1.0
-    focal_gamma: float = 2.0
-    focal_alpha: Optional[float] = 0.25
-    eval_thresholds: Optional[List[float]] = field(default_factory=lambda: [0.3, 0.5, 0.7])
+    loss_config: LossConfig = field(default_factory=LossConfig)
+    balance_real_fake: bool = True
+    balanced_positive_ratio: float = 0.5
+    eval_thresholds: Optional[List[float]] = field(default_factory=lambda: [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
     primary_eval_threshold: Optional[float] = None
     lr_scheduler_type: Optional[str] = None
     lr_scheduler_factor: float = 0.5
     lr_scheduler_patience: int = 2
+    early_stopping_patience: Optional[int] = None
+    early_stopping_min_delta: float = 1e-4
     model_config: HybridForgeryConfig = field(default_factory=HybridForgeryConfig)
 
     def resolved_device(self) -> torch.device:
@@ -123,7 +82,7 @@ class Trainer:
         self.config = config
         self.device = config.resolved_device()
         self.model = HybridForgeryDetector(config.model_config).to(self.device)
-        self.criterion = self._build_loss_fn()
+        self.loss_fn = CombinedSegmentationLoss(config.loss_config).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
@@ -164,6 +123,7 @@ class Trainer:
         except FileNotFoundError:
             self.val_loader = None
         self.best_val_loss = math.inf
+        self._epochs_without_improvement = 0
         self.start_epoch = 1
         if self.config.resume_from:
             self.start_epoch = self._load_checkpoint(self.config.resume_from)
@@ -180,6 +140,12 @@ class Trainer:
         if pin_memory is None:
             pin_memory = self.device.type == "cuda"
 
+        sampler = None
+        if shuffle and self.config.balance_real_fake:
+            sampler = self._build_balanced_sampler(dataset)
+            if sampler is not None:
+                shuffle = False
+
         loader_kwargs = dict(
             batch_size=self.config.batch_size,
             shuffle=shuffle,
@@ -187,12 +153,31 @@ class Trainer:
             pin_memory=pin_memory,
             collate_fn=self._collate_batch,
         )
+        if sampler is not None:
+            loader_kwargs["sampler"] = sampler
         if self.config.num_workers > 0:
             loader_kwargs["persistent_workers"] = self.config.persistent_workers
             if self.config.prefetch_factor is not None:
                 loader_kwargs["prefetch_factor"] = self.config.prefetch_factor
 
         return DataLoader(dataset, **loader_kwargs)
+
+    def _build_balanced_sampler(self, dataset: PreparedForgeryDataset) -> Optional[WeightedRandomSampler]:
+        labels = getattr(dataset, "sample_labels", None)
+        if not labels:
+            return None
+        label_tensor = torch.tensor(labels, dtype=torch.long)
+        class_counts = torch.bincount(label_tensor, minlength=2).float()
+        if class_counts.sum() == 0:
+            return None
+        pos_ratio = float(self.config.balanced_positive_ratio)
+        pos_ratio = min(max(pos_ratio, 0.05), 0.95)
+        neg_ratio = 1.0 - pos_ratio
+        class_weights = torch.zeros_like(class_counts)
+        class_weights[0] = neg_ratio / class_counts[0].clamp_min(1.0)
+        class_weights[1] = pos_ratio / class_counts[1].clamp_min(1.0)
+        sample_weights = class_weights[label_tensor]
+        return WeightedRandomSampler(sample_weights.double(), num_samples=len(sample_weights), replacement=True)
 
     def _should_include_aux_features(self) -> bool:
         if self.config.include_aux_features is not None:
@@ -249,49 +234,6 @@ class Trainer:
             if torch.is_tensor(tensor):
                 noise[key] = tensor
         return noise or None
-
-    def _build_loss_fn(self) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-        loss_type = (self.config.loss_type or "bce").lower()
-        dice_loss = SoftDiceLoss(smooth=self.config.dice_smooth)
-
-        def bce_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-            pos_weight = self._get_pos_weight_tensor(logits)
-            return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
-
-        if loss_type == "dice":
-            return lambda logits, targets: dice_loss(logits, targets)
-        if loss_type == "focal":
-            focal = FocalLoss(
-                gamma=self.config.focal_gamma,
-                alpha=self.config.focal_alpha,
-                pos_weight=self.config.pos_weight,
-            )
-
-            def focal_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-                return focal(logits, targets)
-
-            return focal_loss
-        if loss_type == "bce_dice":
-            bce_weight = self.config.bce_weight
-            dice_weight = self.config.dice_weight
-            denom = bce_weight + dice_weight
-            bce_scale = bce_weight / denom if denom > 0 else 0.5
-            dice_scale = dice_weight / denom if denom > 0 else 0.5
-
-            def combined_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-                return bce_scale * bce_loss(logits, targets) + dice_scale * dice_loss(logits, targets)
-
-            return combined_loss
-        return bce_loss
-
-    def _get_pos_weight_tensor(self, reference: torch.Tensor) -> Optional[torch.Tensor]:
-        if self.config.pos_weight is None:
-            return None
-        return torch.tensor(
-            self.config.pos_weight,
-            device=reference.device,
-            dtype=reference.dtype,
-        )
 
     def _build_scheduler(self):
         sched_type = (self.config.lr_scheduler_type or "").lower()
@@ -369,13 +311,30 @@ class Trainer:
                         f"best_thr={best_thr_fmt} best_f1={best_f1_fmt}"
                     )
 
+            improved = False
+            if self.val_loader is not None:
+                val_loss_value = val_metrics.get("loss", math.inf)
+                if math.isfinite(val_loss_value):
+                    improved = self._register_val_result(val_loss_value)
+
             if epoch % self.config.checkpoint_interval == 0:
-                self._save_checkpoint(epoch, val_metrics)
+                self._save_checkpoint(epoch, val_metrics, is_best=improved)
 
             scheduler_metric = val_metrics.get("loss", train_loss)
             if math.isnan(scheduler_metric):
                 scheduler_metric = train_loss
             self._step_scheduler(scheduler_metric)
+
+            if (
+                self.val_loader is not None
+                and self.config.early_stopping_patience is not None
+                and self._epochs_without_improvement >= self.config.early_stopping_patience
+            ):
+                print(
+                    f"Early stopping triggered after {self._epochs_without_improvement} epochs "
+                    "without validation improvement."
+                )
+                break
         return history
 
     def _run_epoch(self, epoch: int) -> float:
@@ -397,7 +356,7 @@ class Trainer:
                 logits = self.model(images, noise_features=noise_inputs)
                 if logits.shape[-2:] != masks.shape[-2:]:
                     logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-                loss = self.criterion(logits, masks)
+                loss, _ = self.loss_fn(logits, masks)
             running_loss += loss.item()
 
             scaled_loss = loss / accum_target
@@ -452,7 +411,7 @@ class Trainer:
                 logits = self.model(images, noise_features=noise_inputs)
             if logits.shape[-2:] != masks.shape[-2:]:
                 logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-            loss = self.criterion(logits, masks)
+            loss, _ = self.loss_fn(logits, masks)
             probs = torch.sigmoid(logits)
             self._update_threshold_stats(probs, masks, threshold_stats)
 
@@ -480,7 +439,17 @@ class Trainer:
             )
         return result
 
-    def _save_checkpoint(self, epoch: int, val_metrics: Dict[str, float]) -> None:
+    def _register_val_result(self, current_loss: float) -> bool:
+        delta = self.config.early_stopping_min_delta
+        improved = current_loss + delta < self.best_val_loss
+        if improved:
+            self.best_val_loss = current_loss
+            self._epochs_without_improvement = 0
+        else:
+            self._epochs_without_improvement += 1
+        return improved
+
+    def _save_checkpoint(self, epoch: int, val_metrics: Dict[str, float], is_best: bool = False) -> None:
         checkpoint = {
             "epoch": epoch,
             "model_state": self.model.state_dict(),
@@ -494,10 +463,7 @@ class Trainer:
         }
         target = self.checkpoint_dir / f"epoch_{epoch:03d}.pt"
         torch.save(checkpoint, target)
-
-        current_loss = val_metrics.get("loss", math.inf)
-        if self.config.save_best_only and current_loss < self.best_val_loss:
-            self.best_val_loss = current_loss
+        if is_best or not self.config.save_best_only:
             best_path = self.checkpoint_dir / "best.pt"
             torch.save(checkpoint, best_path)
 
@@ -514,6 +480,7 @@ class Trainer:
             self.scaler.load_state_dict(scaler_state)
         val_loss = checkpoint.get("val_metrics", {}).get("loss", math.inf)
         self.best_val_loss = val_loss
+        self._epochs_without_improvement = 0
         loaded_epoch = checkpoint.get("epoch", 0)
         print(f"Loaded checkpoint from {path} (epoch {loaded_epoch})")
         return loaded_epoch + 1

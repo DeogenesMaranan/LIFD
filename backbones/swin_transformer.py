@@ -7,9 +7,15 @@ import timm
 class SwinTinyBackbone(nn.Module):
     """Swin Transformer Tiny backbone for capturing global context."""
 
-    def __init__(self, pretrained: bool = True, out_indices=(0, 1, 2, 3)) -> None:
+    def __init__(
+        self,
+        pretrained: bool = True,
+        out_indices=(0, 1, 2, 3),
+        enforce_input_size: bool = False,
+    ) -> None:
         super().__init__()
         self.out_indices = out_indices
+        self.enforce_input_size = enforce_input_size
         self.model = timm.create_model(
             "swin_tiny_patch4_window7_224",
             pretrained=pretrained,
@@ -23,7 +29,7 @@ class SwinTinyBackbone(nn.Module):
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         """Return hierarchical Swin features (high → low resolution)."""
 
-        if self.expected_hw and x.shape[-2:] != self.expected_hw:
+        if self.enforce_input_size and self.expected_hw and x.shape[-2:] != self.expected_hw:
             x = F.interpolate(x, size=self.expected_hw, mode="bilinear", align_corners=False)
         features = self.model(x)
         return list(features)

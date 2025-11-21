@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -58,6 +59,9 @@ def evaluate_split(
     device: Optional[torch.device | str] = None,
     max_batches: Optional[int] = None,
     threshold: float = 0.5,
+    auto_threshold: bool = False,
+    threshold_candidates: Optional[Sequence[float]] = None,
+    threshold_metric: str = "f1",
 ) -> EvaluationSummary:
     """Compute pixel-wise metrics and confusion matrix on a given split."""
 
@@ -72,7 +76,16 @@ def evaluate_split(
     total_recall = 0.0
     batches = 0
 
-    conf_counts = torch.zeros(2, 2, dtype=torch.double, device=resolved_device)
+    if auto_threshold:
+        candidate_thresholds = sorted({float(thr) for thr in (threshold_candidates or train_config.eval_thresholds or [])})
+        if not candidate_thresholds:
+            candidate_thresholds = [threshold]
+    else:
+        candidate_thresholds = [threshold]
+    threshold_stats = {
+        float(thr): {"tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0}
+        for thr in candidate_thresholds
+    }
     iterator = dataloader
     if tqdm:
         iterator = tqdm(iterator, desc=f"Evaluating {split}", leave=False)
@@ -87,17 +100,25 @@ def evaluate_split(
                 logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
             loss = criterion(logits, masks)
             probs = torch.sigmoid(logits)
-            preds = (probs > threshold).float()
-
-            dice, iou = _segmentation_metrics(preds, masks)
-            precision, recall = _precision_recall(preds, masks)
-            conf_counts += _confusion_counts(preds, masks)
-
+            for thr in candidate_thresholds:
+                preds = (probs > thr).float()
+                stats = threshold_stats[thr]
+                tp = (preds * masks).sum().double().item()
+                fp = (preds * (1 - masks)).sum().double().item()
+                fn = ((1 - preds) * masks).sum().double().item()
+                tn = ((1 - preds) * (1 - masks)).sum().double().item()
+                stats["tp"] += tp
+                stats["fp"] += fp
+                stats["fn"] += fn
+                stats["tn"] += tn
+                if thr == candidate_thresholds[0]:  # accumulate loss-scale metrics once per loop
+                    dice, iou = _segmentation_metrics(preds, masks)
+                    precision, recall = _precision_recall(preds, masks)
+                    total_dice += dice
+                    total_iou += iou
+                    total_precision += precision
+                    total_recall += recall
             total_loss += loss.item()
-            total_dice += dice
-            total_iou += iou
-            total_precision += precision
-            total_recall += recall
             batches += 1
 
             if max_batches is not None and (batch_idx + 1) >= max_batches:
@@ -106,16 +127,28 @@ def evaluate_split(
     if batches == 0:
         raise RuntimeError(f"No batches evaluated for split '{split}'. Ensure the prepared data exists.")
 
+    metrics_by_threshold, best_info = _finalize_thresholds(threshold_stats)
+    if auto_threshold:
+        selected_threshold = _select_best_threshold(metrics_by_threshold, threshold_metric)
+    else:
+        selected_threshold = float(threshold)
+    selected_metrics = metrics_by_threshold.get(selected_threshold, {})
+
     metrics = {
         "loss": total_loss / batches,
-        "dice": total_dice / batches,
-        "iou": total_iou / batches,
-        "precision": total_precision / batches,
-        "recall": total_recall / batches,
-        "f1": _f1(total_precision / batches, total_recall / batches),
+        "dice": selected_metrics.get("dice", total_dice / batches),
+        "iou": selected_metrics.get("iou", total_iou / batches),
+        "precision": selected_metrics.get("precision", total_precision / batches),
+        "recall": selected_metrics.get("recall", total_recall / batches),
+        "f1": selected_metrics.get(
+            "f1", _f1(total_precision / batches, total_recall / batches)
+        ),
+        "threshold": selected_threshold,
+        "thresholds": metrics_by_threshold,
+        "best_threshold": best_info,
     }
 
-    confusion = conf_counts.cpu().numpy()
+    confusion = _stats_to_confusion(metrics_by_threshold.get(selected_threshold, {}))
     return EvaluationSummary(metrics=metrics, confusion_matrix=confusion, samples=batches)
 
 
@@ -243,6 +276,61 @@ def _confusion_counts(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tenso
     fn = ((1 - preds_flat) * targets_flat).sum()
     tn = ((1 - preds_flat) * (1 - targets_flat)).sum()
     return torch.tensor([[tn, fp], [fn, tp]], dtype=torch.double, device=preds.device)
+
+
+def _finalize_thresholds(stats: Dict[float, Dict[str, float]]) -> tuple[Dict[float, Dict[str, float]], Dict[str, float]]:
+    eps = 1e-8
+    metrics: Dict[float, Dict[str, float]] = {}
+    best_metric = -math.inf
+    best_thr = None
+    for threshold, counts in stats.items():
+        tp = counts["tp"]
+        fp = counts["fp"]
+        fn = counts["fn"]
+        tn = counts["tn"]
+        precision = tp / (tp + fp + eps) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn + eps) if (tp + fn) > 0 else 0.0
+        dice = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+        iou = (tp + eps) / (tp + fp + fn + eps)
+        f1 = (2 * precision * recall / (precision + recall + eps)) if (precision + recall) > 0 else 0.0
+        accuracy = (tp + tn) / (tp + fp + fn + tn + eps)
+        metrics[threshold] = {
+            "dice": dice,
+            "iou": iou,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "accuracy": accuracy,
+            "confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        }
+        if f1 > best_metric:
+            best_metric = f1
+            best_thr = threshold
+    best_summary = {"value": best_thr if best_thr is not None else float("nan")}
+    if best_thr is not None:
+        best_summary.update(metrics[best_thr])
+    return metrics, best_summary
+
+
+def _select_best_threshold(metrics: Dict[float, Dict[str, float]], metric: str) -> float:
+    metric = metric.lower()
+    best_value = -math.inf
+    best_threshold = next(iter(metrics.keys()), 0.5)
+    for threshold, vals in metrics.items():
+        score = vals.get(metric, vals.get("f1", 0.0))
+        if score > best_value:
+            best_value = score
+            best_threshold = threshold
+    return best_threshold
+
+
+def _stats_to_confusion(entry: Dict[str, float]) -> np.ndarray:
+    confusion = entry.get("confusion") if isinstance(entry, dict) else None
+    if not confusion:
+        return np.zeros((2, 2), dtype=float)
+    return np.array(
+        [[confusion.get("tn", 0.0), confusion.get("fp", 0.0)], [confusion.get("fn", 0.0), confusion.get("tp", 0.0)]]
+    )
 
 
 def _f1(precision: float, recall: float) -> float:

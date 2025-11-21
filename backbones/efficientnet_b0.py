@@ -7,9 +7,15 @@ import timm
 class EfficientNetB0Backbone(nn.Module):
     """EfficientNet-B0 feature extractor returning multi-scale features."""
 
-    def __init__(self, pretrained: bool = True, out_indices=(0, 1, 2, 3)) -> None:
+    def __init__(
+        self,
+        pretrained: bool = True,
+        out_indices=(0, 1, 2, 3),
+        enforce_input_size: bool = False,
+    ) -> None:
         super().__init__()
         self.out_indices = out_indices
+        self.enforce_input_size = enforce_input_size
         self.model = timm.create_model(
             "efficientnet_b0",
             pretrained=pretrained,
@@ -23,7 +29,7 @@ class EfficientNetB0Backbone(nn.Module):
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         """Return feature pyramid ordered from high to low resolution."""
 
-        if self.expected_hw and x.shape[-2:] != self.expected_hw:
+        if self.enforce_input_size and self.expected_hw and x.shape[-2:] != self.expected_hw:
             x = F.interpolate(x, size=self.expected_hw, mode="bilinear", align_corners=False)
         features = self.model(x)
         return list(features)

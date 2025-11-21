@@ -31,6 +31,8 @@ class HybridForgeryConfig:
     noise_branch_num_stages: int = 4
     noise_branch_use_residual: bool = True
     noise_branch_use_high_pass: bool = True
+    use_boundary_refiner: bool = True
+    boundary_refiner_channels: int = 64
 
 
 class HybridForgeryDetector(nn.Module):
@@ -106,6 +108,20 @@ class HybridForgeryDetector(nn.Module):
                 nn.Conv2d(self.fused_channels[0], 1, kernel_size=1),
             )
 
+        self.boundary_refiner: nn.Module | None = None
+        if self.config.use_boundary_refiner:
+            in_channels = 2  # mask logits + gradient magnitude
+            self.boundary_refiner = nn.Sequential(
+                nn.Conv2d(in_channels, self.config.boundary_refiner_channels, kernel_size=3, padding=1),
+                nn.GroupNorm(4, self.config.boundary_refiner_channels),
+                nn.GELU(),
+                nn.Conv2d(self.config.boundary_refiner_channels, 1, kernel_size=3, padding=1),
+            )
+            sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32)
+            sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32)
+            self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3), persistent=False)
+            self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3), persistent=False)
+
     def _extract_features(self, x: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
         feature_dict: Dict[str, List[torch.Tensor]] = {}
         for name, backbone in self.backbones.items():
@@ -131,6 +147,10 @@ class HybridForgeryDetector(nn.Module):
                 for feat in fused[1:]:
                     high_res = high_res + F.interpolate(feat, size=high_res.shape[-2:], mode="bilinear", align_corners=False)
             mask_logits = self.simple_head(high_res)
+        if self.boundary_refiner is not None:
+            grad_mag = self._image_gradient_magnitude(x)
+            ref_input = torch.cat([mask_logits, grad_mag], dim=1)
+            mask_logits = mask_logits + self.boundary_refiner(ref_input)
         return mask_logits
 
     @torch.inference_mode()
@@ -176,3 +196,13 @@ class HybridForgeryDetector(nn.Module):
                     dtype=image.dtype,
                 )
         return residual, high_pass
+
+    def _image_gradient_magnitude(self, image: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "sobel_x") or self.boundary_refiner is None:
+            return torch.zeros_like(image[:, :1])
+        kernel_x = self.sobel_x.to(image.device, image.dtype).repeat(image.shape[1], 1, 1, 1)
+        kernel_y = self.sobel_y.to(image.device, image.dtype).repeat(image.shape[1], 1, 1, 1)
+        grad_x = F.conv2d(image, kernel_x, padding=1, groups=image.shape[1])
+        grad_y = F.conv2d(image, kernel_y, padding=1, groups=image.shape[1])
+        grad_mag = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+        return grad_mag.sum(dim=1, keepdim=True)

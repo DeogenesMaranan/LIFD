@@ -87,7 +87,7 @@ class AugmentationConfig:
 
 @dataclass
 class PreparationConfig:
-    target_sizes: Tuple[int, ...] = (256,)
+    target_sizes: Tuple[int, ...] = (384,)
     normalization_mode: str = "zero_one"
     compute_high_pass: bool = True
     gaussian_radius: float = 1.0
@@ -438,6 +438,7 @@ class PreparedForgeryDataset(TorchDataset):
             raise FileNotFoundError(f"No preprocessed samples found for split='{split}', size={target_size}.")
         self.include_features = include_features
         self.return_masks = return_masks
+        self.sample_labels = self._load_or_build_labels()
 
     def __len__(self) -> int:
         return len(self.files)
@@ -460,6 +461,24 @@ class PreparedForgeryDataset(TorchDataset):
             sample["meta"] = meta
             return sample
 
+    def _load_or_build_labels(self) -> List[int]:
+        cache_name = f".labels_{self.split}_{self.target_size}.npy"
+        cache_path = self.prepared_root / cache_name
+        if cache_path.exists():
+            return np.load(cache_path).astype(np.int8).tolist()
+
+        labels: List[int] = []
+        for path in self.files:
+            with np.load(path, allow_pickle=True) as data:
+                if "meta" in data.files:
+                    meta = json.loads(str(data["meta"].item()))
+                    label = 1 if meta.get("label") == "fake" else 0
+                else:
+                    label = 0
+            labels.append(label)
+        np.save(cache_path, np.asarray(labels, dtype=np.int8))
+        return labels
+
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
@@ -481,7 +500,7 @@ if __name__ == "__main__":
         seed=42)
     
     prep = PreparationConfig(
-        target_sizes=(128,), 
+        target_sizes=(384,), 
         normalization_mode="zero_one", 
         compute_high_pass=True)
     
