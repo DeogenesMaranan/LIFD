@@ -144,8 +144,10 @@ class CombinedSegmentationLoss(nn.Module):
 
     def _spatial_gradient(self, tensor: torch.Tensor) -> torch.Tensor:
         padding = self.boundary_kernel_x.shape[-1] // 2
-        grad_x = F.conv2d(tensor, self.boundary_kernel_x, padding=padding)
-        grad_y = F.conv2d(tensor, self.boundary_kernel_y, padding=padding)
+        kernel_x = self.boundary_kernel_x.to(device=tensor.device, dtype=tensor.dtype)
+        kernel_y = self.boundary_kernel_y.to(device=tensor.device, dtype=tensor.dtype)
+        grad_x = F.conv2d(tensor, kernel_x, padding=padding)
+        grad_y = F.conv2d(tensor, kernel_y, padding=padding)
         return torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
 
     def _lovasz_hinge(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
