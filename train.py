@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -73,11 +74,22 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
-        self._autocast_device_type = "cuda" if self.device.type == "cuda" else "cpu"
-        self.scaler = amp.GradScaler(
-            device_type=self._autocast_device_type,
-            enabled=config.use_amp and self.device.type == "cuda",
-        )
+
+        self._autocast_factory = lambda enabled=True: nullcontext()
+        amp_enabled = config.use_amp and self.device.type == "cuda"
+        if amp_enabled:
+            try:
+                self.scaler = amp.GradScaler(device_type="cuda", enabled=True)
+                self._autocast_factory = lambda enabled=True: amp.autocast(
+                    device_type="cuda", enabled=enabled
+                )
+            except TypeError:
+                from torch.cuda.amp import GradScaler as LegacyGradScaler, autocast as legacy_autocast
+
+                self.scaler = LegacyGradScaler(enabled=True)
+                self._autocast_factory = lambda enabled=True: legacy_autocast(enabled=enabled)
+        else:
+            self.scaler = amp.GradScaler(enabled=False)
 
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +148,9 @@ class Trainer:
     def _prepare_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
+    def _autocast(self):
+        return self._autocast_factory(self.scaler.is_enabled())
+
     def train(self) -> Dict[str, List[float]]:
         history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_dice": [], "val_iou": []}
         if self.start_epoch > self.config.num_epochs:
@@ -174,7 +189,7 @@ class Trainer:
         for step, batch in enumerate(iterator, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
-            with amp.autocast(device_type=self._autocast_device_type, enabled=self.scaler.is_enabled()):
+            with self._autocast():
                 logits = self.model(images)
                 if logits.shape[-2:] != masks.shape[-2:]:
                     logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
@@ -220,7 +235,7 @@ class Trainer:
         for batch_idx, batch in enumerate(self.val_loader, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
-            with amp.autocast(device_type=self._autocast_device_type, enabled=self.scaler.is_enabled()):
+            with self._autocast():
                 logits = self.model(images)
             if logits.shape[-2:] != masks.shape[-2:]:
                 logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
