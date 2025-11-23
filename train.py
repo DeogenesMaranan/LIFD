@@ -38,7 +38,7 @@ class TrainConfig:
     :func:`run_training`.
     """
 
-    prepared_root: str = "prepared/CASIA2"
+    prepared_roots: List[str] = field(default_factory=lambda: ["prepared/CASIA2"])
     target_size: int = 384
     train_split: str = "train"
     val_split: str = "val"
@@ -118,6 +118,14 @@ class Trainer:
             self.scaler = amp.GradScaler(enabled=False)
 
         self.checkpoint_dir = Path(config.checkpoint_dir)
+
+    def train_all(self):
+        for prepared_root in self.config.prepared_roots:
+            print(f"Training on dataset: {prepared_root}")
+            self.config.prepared_root = prepared_root
+            self.train()
+
+    def train(self):
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.train_loader = self._build_dataloader(config.train_split, shuffle=True)
@@ -467,10 +475,11 @@ class Trainer:
         steps = 0
         max_val_batches = self.config.max_val_batches
         threshold_stats = self._init_threshold_accumulators()
-            iterator = self.val_loader
-            if tqdm:
-                iterator = tqdm(iterator, desc="[val]", leave=False)
-            for batch_idx, batch in enumerate(iterator, start=1):
+
+        iterator = self.val_loader
+        if tqdm:
+            iterator = tqdm(iterator, desc="[val]", leave=False)
+        for batch_idx, batch in enumerate(iterator, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
             noise_inputs = self._extract_noise_inputs(batch)
@@ -522,7 +531,7 @@ class Trainer:
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "scaler_state": self.scaler.state_dict(),
-                "epoch_stats": []
+            "epoch_stats": [],
             "config": {
                 **asdict(self.config),
                 "model_config": asdict(self.config.model_config),

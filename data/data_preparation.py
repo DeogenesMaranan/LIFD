@@ -49,18 +49,23 @@ except AttributeError:
 @dataclass
 class DatasetStructureConfig:
     dataset_root: Path | str
-    dataset_name: str
+    dataset_names: List[str] | str
     real_subdir: str = "real"
     fake_subdir: str = "fake"
     mask_subdir: str = "mask"
     mask_suffix: str = ""
     prepared_root: Path | str = "prepared"
 
-    def as_path(self) -> Path:
-        return Path(self.dataset_root) / self.dataset_name if self.dataset_name else Path(self.dataset_root)
+    def get_dataset_names(self) -> List[str]:
+        if isinstance(self.dataset_names, str):
+            return [self.dataset_names]
+        return list(self.dataset_names)
 
-    def prepared_path(self) -> Path:
-        return Path(self.prepared_root) / self.dataset_name
+    def as_path(self, dataset_name: str) -> Path:
+        return Path(self.dataset_root) / dataset_name if dataset_name else Path(self.dataset_root)
+
+    def prepared_path(self, dataset_name: str) -> Path:
+        return Path(self.prepared_root) / dataset_name
 
 
 @dataclass
@@ -69,9 +74,10 @@ class SplitConfig:
     val: float = 0.15
     test: float = 0.15
     seed: int = 13
+    enable_test_split: bool = True
 
     def validate(self) -> None:
-        total = self.train + self.val + self.test
+        total = self.train + self.val + (self.test if self.enable_test_split else 0.0)
         if not math.isclose(total, 1.0, rel_tol=1e-3):
             raise ValueError(f"Split percentages must add up to 1.0, got {total:.4f}")
 
@@ -142,84 +148,97 @@ class DataPreparationPipeline:
             self.max_workers = max(1, min(max_workers, cpu_count))
         self._rng = random.Random(self.split.seed)
         self._aug_seed_base = self.split.seed + 1234
-        self._prepared_root = self.structure.prepared_path()
-        self._prepared_root.mkdir(parents=True, exist_ok=True)
         self._sample_counter = 0
-        self._last_sample_log = self._prepared_root / "last_sample.log"
+        self._last_sample_log = None
 
-    def prepare(self) -> pd.DataFrame:
-        samples_by_label = self._collect_samples()
-        split_map = self._split_samples(samples_by_label)
-        manifest_entries: List[Dict[str, Any]] = []
+    def prepare(self, test_only: bool = False) -> Dict[str, pd.DataFrame]:
+        """
+        If test_only is True, only process the test split for all datasets.
+        Returns a dict mapping dataset_name to manifest DataFrame.
+        """
+        results = {}
+        for dataset_name in self.structure.get_dataset_names():
+            prepared_root = self.structure.prepared_path(dataset_name)
+            prepared_root.mkdir(parents=True, exist_ok=True)
+            self._prepared_root = prepared_root
+            self._last_sample_log = prepared_root / "last_sample.log"
 
-        print("Samples per split:", {k: len(v) for k, v in split_map.items()})
+            samples_by_label = self._collect_samples(dataset_name)
+            split_map = self._split_samples(samples_by_label)
+            if not self.split.enable_test_split:
+                split_map.pop("test", None)
+            if test_only:
+                split_map = {"test": split_map.get("test", [])}
 
-        total_samples = sum(len(samples) for samples in split_map.values())
-        progress = tqdm(total=total_samples, desc="Preparing samples", unit="sample") if tqdm else None
+            print(f"[{dataset_name}] Samples per split:", {k: len(v) for k, v in split_map.items()})
 
-        executor = ThreadPoolExecutor(max_workers=self.max_workers) if self.max_workers > 1 else None
+            total_samples = sum(len(samples) for samples in split_map.values())
+            progress = tqdm(total=total_samples, desc=f"Preparing samples [{dataset_name}]", unit="sample") if tqdm else None
 
-        try:
-            for split_name, samples in split_map.items():
-                if not samples:
-                    continue
-                if executor is None:
-                    for sample in samples:
-                        self._sample_counter += 1
-                        seed = self._aug_seed_base + self._sample_counter
-                        self._log_sample_progress(split_name, sample)
-                        try:
-                            generated_entries = self._process_sample(sample, split_name, seed)
-                        except Exception as exc:
+            executor = ThreadPoolExecutor(max_workers=self.max_workers) if self.max_workers > 1 else None
+            manifest_entries: List[Dict[str, Any]] = []
+            try:
+                for split_name, samples in split_map.items():
+                    if not samples:
+                        continue
+                    if executor is None:
+                        for sample in samples:
+                            self._sample_counter += 1
+                            seed = self._aug_seed_base + self._sample_counter
+                            self._log_sample_progress(split_name, sample)
+                            try:
+                                generated_entries = self._process_sample(sample, split_name, seed)
+                            except Exception as exc:
+                                if progress:
+                                    progress.close()
+                                context = (
+                                    f"Failed while processing '{sample.image_path}'"
+                                    f" (label={sample.label}, split={split_name}).")
+                                traceback.print_exc()
+                                raise RuntimeError(context) from exc
+                            manifest_entries.extend(generated_entries)
                             if progress:
-                                progress.close()
-                            context = (
-                                f"Failed while processing '{sample.image_path}'"
-                                f" (label={sample.label}, split={split_name}).")
-                            traceback.print_exc()
-                            raise RuntimeError(context) from exc
-                        manifest_entries.extend(generated_entries)
-                        if progress:
-                            progress.update(1)
-                else:
-                    future_map = {}
-                    for sample in samples:
-                        self._sample_counter += 1
-                        seed = self._aug_seed_base + self._sample_counter
-                        self._log_sample_progress(split_name, sample)
-                        future = executor.submit(self._process_sample, sample, split_name, seed)
-                        future_map[future] = sample
-                    for future in as_completed(future_map):
-                        sample = future_map[future]
-                        try:
-                            generated_entries = future.result()
-                        except Exception as exc:
+                                progress.update(1)
+                    else:
+                        future_map = {}
+                        for sample in samples:
+                            self._sample_counter += 1
+                            seed = self._aug_seed_base + self._sample_counter
+                            self._log_sample_progress(split_name, sample)
+                            future = executor.submit(self._process_sample, sample, split_name, seed)
+                            future_map[future] = sample
+                        for future in as_completed(future_map):
+                            sample = future_map[future]
+                            try:
+                                generated_entries = future.result()
+                            except Exception as exc:
+                                if progress:
+                                    progress.close()
+                                context = (
+                                    f"Failed while processing '{sample.image_path}'"
+                                    f" (label={sample.label}, split={split_name}).")
+                                traceback.print_exc()
+                                raise RuntimeError(context) from exc
+                            manifest_entries.extend(generated_entries)
                             if progress:
-                                progress.close()
-                            context = (
-                                f"Failed while processing '{sample.image_path}'"
-                                f" (label={sample.label}, split={split_name}).")
-                            traceback.print_exc()
-                            raise RuntimeError(context) from exc
-                        manifest_entries.extend(generated_entries)
-                        if progress:
-                            progress.update(1)
-        finally:
-            if progress:
-                progress.close()
-            if executor:
-                executor.shutdown(wait=True)
+                                progress.update(1)
+            finally:
+                if progress:
+                    progress.close()
+                if executor:
+                    executor.shutdown(wait=True)
 
-        self._create_tar_shards(manifest_entries)
+            self._create_tar_shards(manifest_entries)
 
-        manifest_df = pd.DataFrame(manifest_entries)
-        manifest_path = self._prepared_root / MANIFEST_FILENAME
-        manifest_df.to_parquet(manifest_path, index=False)
+            manifest_df = pd.DataFrame(manifest_entries)
+            manifest_path = prepared_root / MANIFEST_FILENAME
+            manifest_df.to_parquet(manifest_path, index=False)
 
-        split_counts = manifest_df.groupby("split").size().to_dict() if not manifest_df.empty else {}
-        print("Artifacts per split:", split_counts)
+            split_counts = manifest_df.groupby("split").size().to_dict() if not manifest_df.empty else {}
+            print(f"[{dataset_name}] Artifacts per split:", split_counts)
 
-        return manifest_df
+            results[dataset_name] = manifest_df
+        return results
 
     # ----------------- TAR Sharding ----------------- #
     def _create_tar_shards(self, manifest_entries: List[Dict[str, Any]], shard_size: int = 500) -> None:
@@ -291,8 +310,8 @@ class DataPreparationPipeline:
         with Image.open(path) as image:
             return image.convert(mode)
 
-    def _collect_samples(self) -> Dict[str, List[SampleRecord]]:
-        dataset_path = self.structure.as_path()
+    def _collect_samples(self, dataset_name: str) -> Dict[str, List[SampleRecord]]:
+        dataset_path = self.structure.as_path(dataset_name)
         real_dir = dataset_path / self.structure.real_subdir
         fake_dir = dataset_path / self.structure.fake_subdir
         mask_dir = dataset_path / self.structure.mask_subdir
@@ -337,10 +356,11 @@ class DataPreparationPipeline:
                 continue
             train_count = int(total * self.split.train)
             val_count = int(total * self.split.val)
-            test_count = max(0, total - train_count - val_count)
+            test_count = max(0, total - train_count - val_count) if self.split.enable_test_split else 0
             split_map["train"].extend(shuffled[:train_count])
             split_map["val"].extend(shuffled[train_count:train_count + val_count])
-            split_map["test"].extend(shuffled[train_count + val_count:train_count + val_count + test_count])
+            if self.split.enable_test_split:
+                split_map["test"].extend(shuffled[train_count + val_count:train_count + val_count + test_count])
         return split_map
 
     def _process_sample(self, sample: SampleRecord, split_name: str,
@@ -634,9 +654,10 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
 
+    # Example: process multiple datasets
     structure = DatasetStructureConfig(
         dataset_root="./datasets",
-        dataset_name="CASIA2",
+        dataset_names=["CASIA2", "AnotherDataset"],
         real_subdir="real",
         fake_subdir="fake",
         mask_subdir="mask",
@@ -644,16 +665,35 @@ if __name__ == "__main__":
         prepared_root="prepared",
     )
 
-    split = SplitConfig(train=0.7, val=0.15, test=0.15, seed=42)
-    
+    # Option 1: normal split (train/val/test)
+    split = SplitConfig(train=0.7, val=0.15, test=0.15, seed=42, enable_test_split=True)
     prep = PreparationConfig(target_sizes=(384,), normalization_mode="zero_one", compute_high_pass=True)
-    
     augment = AugmentationConfig(enable=True, copies_per_sample=2, max_rotation_degrees=15,
                                  crop_scale_range=(0.8, 1.0), noise_std_range=(0.0, 0.03))
-
     pipeline = DataPreparationPipeline(structure, split, prep, augment)
-    manifest_df = pipeline.prepare()
+    results = pipeline.prepare()
     print("Preparation finished.")
-    if not manifest_df.empty:
-        for split_name, count in manifest_df.groupby("split").size().items():
-            print(f"{split_name}: {count} artifacts")
+    for ds_name, manifest_df in results.items():
+        if not manifest_df.empty:
+            for split_name, count in manifest_df.groupby("split").size().items():
+                print(f"{ds_name} - {split_name}: {count} artifacts")
+
+    # Option 2: skip test split
+    split_no_test = SplitConfig(train=0.8, val=0.2, test=0.0, seed=42, enable_test_split=False)
+    pipeline_no_test = DataPreparationPipeline(structure, split_no_test, prep, augment)
+    results_no_test = pipeline_no_test.prepare()
+    print("Preparation (no test split) finished.")
+    for ds_name, manifest_df in results_no_test.items():
+        if not manifest_df.empty:
+            for split_name, count in manifest_df.groupby("split").size().items():
+                print(f"{ds_name} - {split_name}: {count} artifacts")
+
+    # Option 3: test split only
+    split_test_only = SplitConfig(train=0.0, val=0.0, test=1.0, seed=42, enable_test_split=True)
+    pipeline_test_only = DataPreparationPipeline(structure, split_test_only, prep, augment)
+    results_test_only = pipeline_test_only.prepare(test_only=True)
+    print("Preparation (test split only) finished.")
+    for ds_name, manifest_df in results_test_only.items():
+        if not manifest_df.empty:
+            for split_name, count in manifest_df.groupby("split").size().items():
+                print(f"{ds_name} - {split_name}: {count} artifacts")
