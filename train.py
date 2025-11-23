@@ -262,6 +262,24 @@ class Trainer:
             self.scheduler.step()
 
     def train(self) -> Dict[str, List[float]]:
+        # Setup paths
+        drive_base_dir = os.environ.get("DRIVE_BASE_DIR", None)
+        if hasattr(self.config, "drive_base_dir"):
+            drive_base_dir = getattr(self.config, "drive_base_dir")
+        if not drive_base_dir:
+            drive_base_dir = "."
+        stats_path = os.path.join(drive_base_dir, "training_statistics.json")
+        stats_csv_path = os.path.join(drive_base_dir, "training_statistics.csv")
+
+        # Load previous stats if present
+        epoch_stats = []
+        if os.path.exists(stats_path):
+            try:
+                with open(stats_path, "r") as f:
+                    epoch_stats = json.load(f)
+            except Exception as e:
+                print(f"Warning: Could not load previous statistics from {stats_path}: {e}")
+
         history: Dict[str, List[float]] = {
             "train_loss": [],
             "val_loss": [],
@@ -270,7 +288,18 @@ class Trainer:
             "val_precision": [],
             "val_recall": [],
             "val_f1": [],
+            "epoch_stats": epoch_stats.copy(),
         }
+        # Also load previous flat CSV rows for appending
+        previous_csv_rows = []
+        if os.path.exists(stats_csv_path):
+            try:
+                with open(stats_csv_path, "r", newline='') as f:
+                    reader = csv.DictReader(f)
+                    previous_csv_rows = list(reader)
+            except Exception as e:
+                print(f"Warning: Could not load previous CSV statistics from {stats_csv_path}: {e}")
+
         if self.start_epoch > self.config.num_epochs:
             print(
                 f"Start epoch ({self.start_epoch}) exceeds configured num_epochs ({self.config.num_epochs}); "
@@ -313,6 +342,38 @@ class Trainer:
                         f"recall={primary_metrics.get('recall', float('nan')):.4f} "
                         f"best_thr={best_thr_fmt} best_f1={best_f1_fmt}"
                     )
+
+            # Save statistics for this epoch
+            epoch_stat = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                **{k: val_metrics.get(k, float("nan")) for k in ["loss", "dice", "iou", "precision", "recall", "f1"]},
+                "thresholds": val_metrics.get("thresholds", {}),
+                "best_threshold": val_metrics.get("best_threshold", {}),
+            }
+            history["epoch_stats"].append(epoch_stat)
+
+            # Save to JSON (append all epochs, not overwrite)
+            try:
+                with open(stats_path, "w") as f:
+                    json.dump(history["epoch_stats"], f, indent=2)
+            except Exception as e:
+                print(f"Warning: Could not save statistics to {stats_path}: {e}")
+
+            # Save to CSV (flat metrics only, append to previous rows)
+            try:
+                flat_keys = ["epoch", "train_loss", "loss", "dice", "iou", "precision", "recall", "f1"]
+                all_rows = previous_csv_rows.copy()
+                row = {k: epoch_stat.get(k, "") for k in flat_keys}
+                all_rows.append(row)
+                with open(stats_csv_path, "w", newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=flat_keys)
+                    writer.writeheader()
+                    for r in all_rows:
+                        writer.writerow(r)
+                previous_csv_rows = all_rows
+            except Exception as e:
+                print(f"Warning: Could not save statistics to {stats_csv_path}: {e}")
 
             improved = False
             if self.val_loader is not None:
