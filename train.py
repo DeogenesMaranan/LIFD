@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import json
+import csv
+import os
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -403,7 +406,10 @@ class Trainer:
         steps = 0
         max_val_batches = self.config.max_val_batches
         threshold_stats = self._init_threshold_accumulators()
-        for batch_idx, batch in enumerate(self.val_loader, start=1):
+            iterator = self.val_loader
+            if tqdm:
+                iterator = tqdm(iterator, desc="[val]", leave=False)
+            for batch_idx, batch in enumerate(iterator, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
             noise_inputs = self._extract_noise_inputs(batch)
@@ -455,6 +461,7 @@ class Trainer:
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "scaler_state": self.scaler.state_dict(),
+                "epoch_stats": []
             "config": {
                 **asdict(self.config),
                 "model_config": asdict(self.config.model_config),
@@ -508,6 +515,33 @@ class Trainer:
         for threshold, stats in accumulators.items():
             preds = (probs > threshold).float()
             inv_preds = 1.0 - preds
+            # Save statistics for this epoch
+            epoch_stats = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                **{k: val_metrics.get(k, float("nan")) for k in ["loss", "dice", "iou", "precision", "recall", "f1"]},
+                "thresholds": val_metrics.get("thresholds", {}),
+                "best_threshold": val_metrics.get("best_threshold", {}),
+            }
+            history["epoch_stats"].append(epoch_stats)
+            # Save to JSON
+            try:
+                with open(stats_path, "w") as f:
+                    json.dump(history["epoch_stats"], f, indent=2)
+            except Exception as e:
+                print(f"Warning: Could not save statistics to {stats_path}: {e}")
+            # Save to CSV (flat metrics only)
+            try:
+                flat_keys = ["epoch", "train_loss", "loss", "dice", "iou", "precision", "recall", "f1"]
+                write_header = not os.path.exists(stats_csv_path)
+                with open(stats_csv_path, "a", newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=flat_keys)
+                    if write_header:
+                        writer.writeheader()
+                    row = {k: epoch_stats.get(k, "") for k in flat_keys}
+                    writer.writerow(row)
+            except Exception as e:
+                print(f"Warning: Could not save statistics to {stats_csv_path}: {e}")
             tp = (preds * targets_bin).sum().double().item()
             fp = (preds * inv_targets).sum().double().item()
             fn = (inv_preds * targets_bin).sum().double().item()
