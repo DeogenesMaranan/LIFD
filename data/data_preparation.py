@@ -1,19 +1,10 @@
-"""Data preparation pipeline for hybrid forgery detection datasets (PyTorch-only).
-
-This module converts raw datasets organised as
-<dataset_root>/<dataset_name>/<real|fake|mask>/... into a preprocessed
-structure that is cheap to load during training. All CPU-heavy image work
-is performed once up front so the training loop can stream tensors quickly.
-"""
-
-from __future__ import annotations
 import io
 import json
 import math
 import os
 import random
-import traceback
 import tarfile
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,7 +36,7 @@ except AttributeError:
     RESAMPLE_BICUBIC = Image.BICUBIC
     RESAMPLE_NEAREST = Image.NEAREST
 
-
+# ----------------- Dataset Structure and Config ----------------- #
 @dataclass
 class DatasetStructureConfig:
     dataset_root: Path | str
@@ -67,7 +58,6 @@ class DatasetStructureConfig:
     def prepared_path(self, dataset_name: str) -> Path:
         return Path(self.prepared_root) / dataset_name
 
-
 @dataclass
 class SplitConfig:
     train: float = 0.7
@@ -80,7 +70,6 @@ class SplitConfig:
         total = self.train + self.val + (self.test if self.enable_test_split else 0.0)
         if not math.isclose(total, 1.0, rel_tol=1e-3):
             raise ValueError(f"Split percentages must add up to 1.0, got {total:.4f}")
-
 
 @dataclass
 class AugmentationConfig:
@@ -95,7 +84,6 @@ class AugmentationConfig:
     crop_scale_range: Tuple[float, float] = (0.9, 1.0)
     color_jitter_factors: Tuple[float, float] = (0.9, 1.1)
     noise_std_range: Tuple[float, float] = (0.0, 0.02)
-
 
 @dataclass
 class PreparationConfig:
@@ -122,14 +110,13 @@ class PreparationConfig:
             return array
         return array.astype(self.storage_dtype)
 
-
 @dataclass
 class SampleRecord:
     image_path: Path
     mask_path: Optional[Path]
     label: str
 
-
+# ----------------- Data Preparation Pipeline ----------------- #
 class DataPreparationPipeline:
     def __init__(self, structure: DatasetStructureConfig,
                  split: SplitConfig | None = None,
@@ -142,20 +129,13 @@ class DataPreparationPipeline:
         self.augment = augment or AugmentationConfig()
         self.split.validate()
         cpu_count = os.cpu_count() or 1
-        if max_workers is None:
-            self.max_workers = cpu_count
-        else:
-            self.max_workers = max(1, min(max_workers, cpu_count))
+        self.max_workers = max(1, min(max_workers or cpu_count, cpu_count))
         self._rng = random.Random(self.split.seed)
         self._aug_seed_base = self.split.seed + 1234
         self._sample_counter = 0
         self._last_sample_log = None
 
     def prepare(self, test_only: bool = False) -> Dict[str, pd.DataFrame]:
-        """
-        If test_only is True, only process the test split for all datasets.
-        Returns a dict mapping dataset_name to manifest DataFrame.
-        """
         results = {}
         for dataset_name in self.structure.get_dataset_names():
             prepared_root = self.structure.prepared_path(dataset_name)
@@ -283,7 +263,7 @@ class DataPreparationPipeline:
                 print(f"{split_name}: created {tar_path} with {len(shard_files)} samples")
         print("All TAR shards created.")
 
-    # ----------------- Internal helper methods (unchanged) ----------------- #
+    # ----------------- Internal Helpers ----------------- #
     def _log_sample_progress(self, split_name: str, sample: SampleRecord) -> None:
         log_entry = {
             "sample_index": self._sample_counter,
@@ -363,6 +343,7 @@ class DataPreparationPipeline:
                 split_map["test"].extend(shuffled[train_count + val_count:train_count + val_count + test_count])
         return split_map
 
+    # ----------------- Sample Processing ----------------- #
     def _process_sample(self, sample: SampleRecord, split_name: str,
                         rng_seed: Optional[int] = None) -> List[Dict[str, Any]]:
         generated: List[Dict[str, Any]] = []
@@ -650,50 +631,37 @@ class PreparedForgeryDataset(TorchDataset):
     def __del__(self) -> None:
         self.close()
 
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Using device:", device)
+# ----------------- Combined Dataset ----------------- #
+class CombinedForgeryDataset(torch.utils.data.Dataset):
+    def __init__(self, prepared_roots, split, target_size, include_features=True, return_masks=True):
+        self.datasets = [
+            PreparedForgeryDataset(
+                prepared_root=root,
+                split=split,
+                target_size=target_size,
+                include_features=include_features,
+                return_masks=return_masks,
+            )
+            for root in prepared_roots
+        ]
+        self.lengths = [len(ds) for ds in self.datasets]
+        self.cumsum = [0]
+        for l in self.lengths:
+            self.cumsum.append(self.cumsum[-1] + l)
+        self.total_len = sum(self.lengths)
 
-    # Example: process multiple datasets
-    structure = DatasetStructureConfig(
-        dataset_root="./datasets",
-        dataset_names=["CASIA2", "AnotherDataset"],
-        real_subdir="real",
-        fake_subdir="fake",
-        mask_subdir="mask",
-        mask_suffix="_gt",
-        prepared_root="prepared",
-    )
+    def __len__(self):
+        return self.total_len
 
-    # Option 1: normal split (train/val/test)
-    split = SplitConfig(train=0.7, val=0.15, test=0.15, seed=42, enable_test_split=True)
-    prep = PreparationConfig(target_sizes=(384,), normalization_mode="zero_one", compute_high_pass=True)
-    augment = AugmentationConfig(enable=True, copies_per_sample=2, max_rotation_degrees=15,
-                                 crop_scale_range=(0.8, 1.0), noise_std_range=(0.0, 0.03))
-    pipeline = DataPreparationPipeline(structure, split, prep, augment)
-    results = pipeline.prepare()
-    print("Preparation finished.")
-    for ds_name, manifest_df in results.items():
-        if not manifest_df.empty:
-            for split_name, count in manifest_df.groupby("split").size().items():
-                print(f"{ds_name} - {split_name}: {count} artifacts")
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += self.total_len
+        if idx < 0 or idx >= self.total_len:
+            raise IndexError(f"Index {idx} out of range for CombinedForgeryDataset of length {self.total_len}")
 
-    # Option 2: skip test split
-    split_no_test = SplitConfig(train=0.8, val=0.2, test=0.0, seed=42, enable_test_split=False)
-    pipeline_no_test = DataPreparationPipeline(structure, split_no_test, prep, augment)
-    results_no_test = pipeline_no_test.prepare()
-    print("Preparation (no test split) finished.")
-    for ds_name, manifest_df in results_no_test.items():
-        if not manifest_df.empty:
-            for split_name, count in manifest_df.groupby("split").size().items():
-                print(f"{ds_name} - {split_name}: {count} artifacts")
+        for ds_idx in range(len(self.datasets)):
+            if self.cumsum[ds_idx] <= idx < self.cumsum[ds_idx + 1]:
+                sample_idx = idx - self.cumsum[ds_idx]
+                return self.datasets[ds_idx][sample_idx]
 
-    # Option 3: test split only
-    split_test_only = SplitConfig(train=0.0, val=0.0, test=1.0, seed=42, enable_test_split=True)
-    pipeline_test_only = DataPreparationPipeline(structure, split_test_only, prep, augment)
-    results_test_only = pipeline_test_only.prepare(test_only=True)
-    print("Preparation (test split only) finished.")
-    for ds_name, manifest_df in results_test_only.items():
-        if not manifest_df.empty:
-            for split_name, count in manifest_df.groupby("split").size().items():
-                print(f"{ds_name} - {split_name}: {count} artifacts")
+        raise IndexError(f"Index {idx} could not be mapped to any dataset")

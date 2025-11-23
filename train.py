@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch import amp
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from data.data_preparation import PreparedForgeryDataset
+from data.data_preparation import PreparedForgeryDataset, CombinedForgeryDataset
 from model.hybrid_forgery_detector import HybridForgeryConfig, HybridForgeryDetector
 from losses.segmentation_losses import CombinedSegmentationLoss, LossConfig
 
@@ -120,7 +120,10 @@ class Trainer:
         self.checkpoint_dir = Path(config.checkpoint_dir)
 
     def train_all(self):
-        for prepared_root in self.config.prepared_roots:
+        import random
+        dataset_roots = self.config.prepared_roots.copy()
+        random.shuffle(dataset_roots)
+        for prepared_root in dataset_roots:
             print(f"Training on dataset: {prepared_root}")
             self.config.prepared_root = prepared_root
             self.train()
@@ -140,13 +143,22 @@ class Trainer:
             self.start_epoch = self._load_checkpoint(self.config.resume_from)
 
     def _build_dataloader(self, split: str, shuffle: bool) -> DataLoader:
-        dataset = PreparedForgeryDataset(
-            prepared_root=self.config.prepared_root,
-            split=split,
-            target_size=self.config.target_size,
-            include_features=self._should_include_aux_features(),
-            return_masks=True,
-        )
+        if split == self.config.train_split and len(self.config.prepared_roots) > 1:
+            dataset = CombinedForgeryDataset(
+                prepared_roots=self.config.prepared_roots,
+                split=split,
+                target_size=self.config.target_size,
+                include_features=self._should_include_aux_features(),
+                return_masks=True,
+            )
+        else:
+            dataset = PreparedForgeryDataset(
+                prepared_root=self.config.prepared_root,
+                split=split,
+                target_size=self.config.target_size,
+                include_features=self._should_include_aux_features(),
+                return_masks=True,
+            )
         pin_memory = self.config.pin_memory
         if pin_memory is None:
             pin_memory = self.device.type == "cuda"
