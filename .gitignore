@@ -1,9 +1,9 @@
-prepared/*
+# Ignore all __pycache__
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
 datasets/*
+prepared/*
 checkpoints/*
-__pycache__/*
-backbones/__pycache__/*
-models/__pycache__/*
-model/__pycache__/*
-losses/__pycache__/*
-data/__pycache__/*

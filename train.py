@@ -12,7 +12,11 @@ import torch.nn.functional as F
 from torch import amp
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from data.data_preparation import PreparedForgeryDataset
+from data.data_preparation import (
+    PreparedForgeryDataset,
+    EvenMultiSourceBatchSampler,
+    EvenMultiSourceBalancedSampler,
+)
 from model.hybrid_forgery_detector import HybridForgeryConfig, HybridForgeryDetector
 from losses.segmentation_losses import CombinedSegmentationLoss, LossConfig
 
@@ -35,7 +39,7 @@ class TrainConfig:
     :func:`run_training`.
     """
 
-    prepared_root: str = "prepared/CASIA2"
+    prepared_root: str | Sequence[str] = "prepared/CASIA2"
     target_size: int = 384
     train_split: str = "train"
     val_split: str = "val"
@@ -141,6 +145,38 @@ class Trainer:
             pin_memory = self.device.type == "cuda"
 
         sampler = None
+        multi_source = False
+        try:
+            prepared_roots = {rec.get("prepared_root") for rec in dataset.records}
+            multi_source = len(prepared_roots) > 1
+        except Exception:
+            multi_source = False
+
+        # If multi-source, use a sampler that keeps per-batch dataset evenness.
+        # If class balancing is requested, use the combined balanced sampler
+        # that performs per-source class-aware sampling; otherwise use the
+        # simpler even-per-source sampler.
+        if shuffle and multi_source:
+            if self.config.balance_real_fake:
+                pos_ratio = float(self.config.balanced_positive_ratio)
+                batch_sampler = EvenMultiSourceBalancedSampler(
+                    dataset, batch_size=self.config.batch_size, pos_ratio=pos_ratio, shuffle=True, seed=self.config.loss_config.__dict__.get('seed', 42) if hasattr(self.config, 'loss_config') else 42
+                )
+            else:
+                batch_sampler = EvenMultiSourceBatchSampler(dataset, batch_size=self.config.batch_size, shuffle=True, drop_last=False, seed=self.config.loss_config.__dict__.get('seed', 42) if hasattr(self.config, 'loss_config') else 42)
+            loader_kwargs = dict(
+                batch_sampler=batch_sampler,
+                num_workers=self.config.num_workers,
+                pin_memory=pin_memory,
+                collate_fn=self._collate_batch,
+            )
+            if self.config.num_workers > 0:
+                loader_kwargs["persistent_workers"] = self.config.persistent_workers
+                if self.config.prefetch_factor is not None:
+                    loader_kwargs["prefetch_factor"] = self.config.prefetch_factor
+            return DataLoader(dataset, **loader_kwargs)
+
+        # Fallback: previous behavior (including optional balanced sampler)
         if shuffle and self.config.balance_real_fake:
             sampler = self._build_balanced_sampler(dataset)
             if sampler is not None:

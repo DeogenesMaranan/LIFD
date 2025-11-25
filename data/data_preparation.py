@@ -17,7 +17,7 @@ import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Sequence
 
 import numpy as np
 import pandas as pd
@@ -532,27 +532,78 @@ class DataPreparationPipeline:
 
 # ----------------- PyTorch Dataset Loader ----------------- #
 class PreparedForgeryDataset(TorchDataset):
-    def __init__(self, prepared_root: Path | str, split: str, target_size: int,
+    def __init__(self, prepared_root: Path | str | Sequence[Path | str], split: str, target_size: int,
                  include_features: bool = True, return_masks: bool = True) -> None:
-        self.prepared_root = Path(prepared_root)
+        """
+        `prepared_root` may be:
+        - a single path to a prepared dataset directory containing `manifest.parquet`,
+        - a list/sequence of such prepared dataset directories, or
+        - the path to a combined manifest parquet (created by the preprocessing pipeline)
+
+        The loader will merge manifests and normalize `relative_path`/`tar_path`
+        entries so they are resolvable against the correct prepared root.
+        """
         self.split = split
         self.target_size = target_size
-        manifest_path = self.prepared_root / MANIFEST_FILENAME
-        if not manifest_path.exists():
-            raise FileNotFoundError(f"Manifest file '{manifest_path}' not found.")
 
-        manifest_df = pd.read_parquet(manifest_path)
-        split_df = manifest_df[(manifest_df["split"] == split) &
-                               (manifest_df["target_size"] == target_size)].reset_index(drop=True)
+        # Normalize input into a list of prepared roots or a combined manifest file
+        roots: List[Path] = []
+        combined_manifest_path: Optional[Path] = None
+
+        # Accept strings, Paths or sequences
+        if isinstance(prepared_root, (list, tuple)):
+            for p in prepared_root:
+                roots.append(Path(p))
+        else:
+            p = Path(prepared_root)
+            if p.is_file() and p.suffix.lower() in {".parquet", ".pq"}:
+                combined_manifest_path = p
+            else:
+                roots.append(p)
+
+        # Load manifests
+        dfs: List[pd.DataFrame] = []
+        if combined_manifest_path is not None:
+            if not combined_manifest_path.exists():
+                raise FileNotFoundError(f"Combined manifest '{combined_manifest_path}' not found.")
+            combined_df = pd.read_parquet(combined_manifest_path)
+            # combined manifest is expected to include a `prepared_root` column
+            if "prepared_root" not in combined_df.columns:
+                # If not present, assume relative paths are relative to the manifest parent
+                combined_df["prepared_root"] = str(combined_manifest_path.parent)
+            dfs.append(combined_df)
+
+        for root in roots:
+            manifest_path = root / MANIFEST_FILENAME
+            if not manifest_path.exists():
+                raise FileNotFoundError(f"Manifest file '{manifest_path}' not found.")
+            df = pd.read_parquet(manifest_path)
+            # Record where these artifacts live so relative paths can be resolved
+            df = df.copy()
+            df["prepared_root"] = str(root)
+            dfs.append(df)
+
+        if not dfs:
+            raise FileNotFoundError("No manifest data found for provided prepared_root(s).")
+
+        manifest_df = pd.concat(dfs, ignore_index=True)
+        # Filter by split and target_size
+        split_df = manifest_df[(manifest_df["split"] == split) & (manifest_df["target_size"] == target_size)].reset_index(drop=True)
         if split_df.empty:
             raise FileNotFoundError(f"No preprocessed samples found for split='{split}', size={target_size}.")
 
-        self.records = split_df.to_dict("records")
-        for record in self.records:
+        # Normalize path separators and keep the prepared_root column
+        records = split_df.to_dict("records")
+        for record in records:
             for key in ("tar_path", "relative_path"):
                 value = record.get(key)
-                if value:
+                if value and isinstance(value, str):
                     record[key] = value.replace("\\", "/")
+
+        self.records = records
+        # Expose a canonical prepared_root attribute for single-root code paths.
+        # If multiple prepared roots are used, this will be the first one.
+        self.prepared_root = Path(records[0].get("prepared_root", "."))
         self.include_features = include_features
         self.return_masks = return_masks
         self._tar_cache: Dict[str, tarfile.TarFile] = {}
@@ -566,7 +617,7 @@ class PreparedForgeryDataset(TorchDataset):
         record = self.records[index]
 
         if record.get("tar_path"):
-            tar_path = self.prepared_root / record["tar_path"]
+            tar_path = Path(record.get("prepared_root", ".")) / record["tar_path"]
             tar = self._get_tar_handle(tar_path)
             member_name = record["tar_member"]
             member = tar.extractfile(member_name)
@@ -582,7 +633,7 @@ class PreparedForgeryDataset(TorchDataset):
             rel_path = record.get("relative_path")
             if not rel_path:
                 raise FileNotFoundError("Record is missing both tar_path and relative_path.")
-            npz_path = self.prepared_root / rel_path
+            npz_path = Path(record.get("prepared_root", ".")) / rel_path
             npz_source = np.load(npz_path, allow_pickle=True)
 
         with npz_source as data:
@@ -603,7 +654,7 @@ class PreparedForgeryDataset(TorchDataset):
 
     def _load_or_build_labels(self) -> List[int]:
         cache_name = f".labels_{self.split}_{self.target_size}.npy"
-        cache_path = self.prepared_root / cache_name
+        cache_path = Path(self.records[0].get("prepared_root", ".")) / cache_name
         if cache_path.exists():
             return np.load(cache_path).astype(np.int8).tolist()
 
@@ -620,7 +671,9 @@ class PreparedForgeryDataset(TorchDataset):
         return handle
 
     def close(self) -> None:
-        for handle in self._tar_cache.values():
+        if not hasattr(self, "_tar_cache") or self._tar_cache is None:
+            return
+        for handle in list(self._tar_cache.values()):
             try:
                 handle.close()
             except Exception:
@@ -628,32 +681,300 @@ class PreparedForgeryDataset(TorchDataset):
         self._tar_cache.clear()
 
     def __del__(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class EvenMultiSourceBatchSampler:
+    """Batch sampler that attempts to produce batches containing an even
+    number of samples from each provided prepared_root (dataset source).
+
+    Behavior:
+    - Groups dataset indices by the `prepared_root` value present on each
+      record (the loader annotates this column during init).
+    - For each batch, requests `batch_size // num_sources` samples from each
+      source and distributes any remainder to the first sources.
+    - If a source runs out of samples during an epoch, it is reshuffled and
+      reused (this produces oversampling but keeps per-batch balance).
+    """
+
+    def __init__(self, dataset: PreparedForgeryDataset, batch_size: int, shuffle: bool = True, drop_last: bool = False, seed: int = 42):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+
+    def __iter__(self):
+        # Group indices by prepared_root
+        groups = {}
+        for idx, rec in enumerate(self.dataset.records):
+            root = rec.get("prepared_root", "__none__")
+            groups.setdefault(root, []).append(idx)
+
+        roots = list(groups.keys())
+        if not roots:
+            return
+
+        num_roots = len(roots)
+        base_quota = self.batch_size // num_roots
+        remainder = self.batch_size % num_roots
+
+        # Prepare per-root pools (mutable queues)
+        rng = random.Random(self.seed)
+        pools = {}
+        for root in roots:
+            items = groups[root].copy()
+            if self.shuffle:
+                rng.shuffle(items)
+            pools[root] = items
+
+        # Compute number of batches: use the maximum number of batches required
+        # to exhaust any source (so all sources contribute roughly equally).
+        batches_est = 0
+        for i, root in enumerate(roots):
+            per_batch = base_quota + (1 if i < remainder else 0)
+            if per_batch <= 0:
+                continue
+            batches_for_root = math.ceil(len(groups[root]) / per_batch)
+            batches_est = max(batches_est, batches_for_root)
+
+        if batches_est == 0:
+            return
+
+        for _ in range(batches_est):
+            batch = []
+            for i, root in enumerate(roots):
+                per = base_quota + (1 if i < remainder else 0)
+                pool = pools[root]
+                # Replenish pool by reshuffling the original list if needed
+                while len(pool) < per:
+                    refill = groups[root].copy()
+                    if self.shuffle:
+                        rng.shuffle(refill)
+                    pool.extend(refill)
+                for _ in range(per):
+                    batch.append(pool.pop(0))
+
+            if len(batch) < self.batch_size:
+                if self.drop_last:
+                    continue
+                # Fill missing spots by sampling from available pools
+                i = 0
+                while len(batch) < self.batch_size:
+                    root = roots[i % num_roots]
+                    if not pools[root]:
+                        refill = groups[root].copy()
+                        if self.shuffle:
+                            rng.shuffle(refill)
+                        pools[root].extend(refill)
+                    batch.append(pools[root].pop(0))
+                    i += 1
+
+            yield batch
+
+    def __len__(self):
+        # Conservative length: computed similarly to iteration
+        groups = {}
+        for idx, rec in enumerate(self.dataset.records):
+            root = rec.get("prepared_root", "__none__")
+            groups.setdefault(root, []).append(idx)
+        roots = list(groups.keys())
+        if not roots:
+            return 0
+        num_roots = len(roots)
+        base_quota = self.batch_size // num_roots
+        remainder = self.batch_size % num_roots
+        batches_est = 0
+        for i, root in enumerate(roots):
+            per_batch = base_quota + (1 if i < remainder else 0)
+            if per_batch <= 0:
+                continue
+            batches_for_root = math.ceil(len(groups[root]) / per_batch)
+            batches_est = max(batches_est, batches_for_root)
+        return batches_est
+    
+
+class EvenMultiSourceBalancedSampler:
+    """Sampler that builds batches balanced across prepared_root sources
+    while also performing per-source class-balanced sampling.
+
+    For each source, we compute per-sample probabilities so that the expected
+    fraction of positive (fake) samples matches `pos_ratio`. During batch
+    construction we draw samples from each source according to these
+    probabilities (with replacement) and assemble them into a single batch
+    preserving even per-source counts.
+    """
+
+    def __init__(self, dataset: PreparedForgeryDataset, batch_size: int, pos_ratio: float = 0.5, shuffle: bool = True, seed: int = 42):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.pos_ratio = float(pos_ratio)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+
+    def __iter__(self):
+        # Group indices by prepared_root
+        groups = {}
+        for idx, rec in enumerate(self.dataset.records):
+            root = rec.get("prepared_root", "__none__")
+            groups.setdefault(root, []).append(idx)
+
+        roots = list(groups.keys())
+        if not roots:
+            return
+
+        num_roots = len(roots)
+        base_quota = self.batch_size // num_roots
+        remainder = self.batch_size % num_roots
+
+        rng = np.random.default_rng(self.seed)
+
+        # Precompute per-source sampling probabilities
+        probs_by_root = {}
+        for root in roots:
+            idxs = groups[root]
+            labels = np.array([1 if self.dataset.records[i].get("label") == "fake" else 0 for i in idxs], dtype=np.int8)
+            pos_count = labels.sum()
+            neg_count = labels.size - pos_count
+            pos_ratio = min(max(self.pos_ratio, 0.0), 1.0)
+            neg_ratio = 1.0 - pos_ratio
+            # Avoid divide-by-zero
+            pos_count = max(1, int(pos_count))
+            neg_count = max(1, int(neg_count))
+            weights = np.zeros_like(labels, dtype=np.float64)
+            weights[labels == 1] = pos_ratio / pos_count
+            weights[labels == 0] = neg_ratio / neg_count
+            # Normalize to sum to 1
+            weights = weights / weights.sum()
+            probs_by_root[root] = (np.array(idxs, dtype=np.int64), weights)
+
+        # Compute number of batches similarly to other samplers
+        batches_est = 0
+        for i, root in enumerate(roots):
+            per_batch = base_quota + (1 if i < remainder else 0)
+            if per_batch <= 0:
+                continue
+            batches_for_root = math.ceil(len(groups[root]) / per_batch)
+            batches_est = max(batches_est, batches_for_root)
+
+        if batches_est == 0:
+            return
+
+        for _ in range(batches_est):
+            batch = []
+            for i, root in enumerate(roots):
+                per = base_quota + (1 if i < remainder else 0)
+                idxs, probs = probs_by_root[root]
+                # Sample with replacement according to per-source class-aware probs
+                chosen = rng.choice(idxs, size=per, replace=True, p=probs)
+                batch.extend(int(x) for x in chosen)
+            # If some rounding causes batch size mismatch, pad by sampling from first root
+            if len(batch) < self.batch_size:
+                root = roots[0]
+                idxs, probs = probs_by_root[root]
+                extra = self.batch_size - len(batch)
+                chosen = rng.choice(idxs, size=extra, replace=True, p=probs)
+                batch.extend(int(x) for x in chosen)
+            yield batch
+
+    def __len__(self):
+        # Conservative length
+        groups = {}
+        for idx, rec in enumerate(self.dataset.records):
+            root = rec.get("prepared_root", "__none__")
+            groups.setdefault(root, []).append(idx)
+        roots = list(groups.keys())
+        if not roots:
+            return 0
+        num_roots = len(roots)
+        base_quota = self.batch_size // num_roots
+        remainder = self.batch_size % num_roots
+        batches_est = 0
+        for i, root in enumerate(roots):
+            per_batch = base_quota + (1 if i < remainder else 0)
+            if per_batch <= 0:
+                continue
+            batches_for_root = math.ceil(len(groups[root]) / per_batch)
+            batches_est = max(batches_est, batches_for_root)
+        return batches_est
+    
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Using device:", device)
+    """
+    Prepare multiple datasets and write a combined manifest for downstream
+    multi-dataset training. This example prepares the three datasets used in
+    the repository examples.
+    """
+    datasets = [
+        DatasetStructureConfig(
+            dataset_root="./datasets/CASIA2",
+            dataset_name="casia",
+            real_subdir="real",
+            fake_subdir="fake",
+            mask_subdir="mask",
+            mask_suffix="_gt",
+            prepared_root="prepared",
+        ),
+        DatasetStructureConfig(
+            dataset_root="./datasets/FantasticReality",
+            dataset_name="fantastic_reality",
+            real_subdir="ColorRealImages",
+            fake_subdir="ColorFakeImages",
+            mask_subdir="masks",
+            mask_suffix="",
+            prepared_root="prepared",
+        ),
+        DatasetStructureConfig(
+            dataset_root="./datasets/COVERAGE",
+            dataset_name="coverage",
+            real_subdir="real",
+            fake_subdir="fake",
+            mask_subdir="mask",
+            mask_suffix="forged",
+            prepared_root="prepared",
+        ),
+    ]
 
-    structure = DatasetStructureConfig(
-        dataset_root="./datasets",
-        dataset_name="CASIA2",
-        real_subdir="real",
-        fake_subdir="fake",
-        mask_subdir="mask",
-        mask_suffix="_gt",
-        prepared_root="prepared",
-    )
+    # Per-dataset split configs (honour dataset-specific seeds)
+    per_dataset_splits = {
+        "casia": SplitConfig(train=0.8, val=0.2, test=0.0, seed=6),
+        "fantastic_reality": SplitConfig(train=0.8, val=0.2, test=0.0, seed=10),
+        "coverage": SplitConfig(train=0.0, val=0.0, test=1.0, seed=4),
+    }
 
-    split = SplitConfig(train=0.7, val=0.15, test=0.15, seed=42)
-    
-    prep = PreparationConfig(target_sizes=(384,), normalization_mode="zero_one", compute_high_pass=True)
-    
-    augment = AugmentationConfig(enable=True, copies_per_sample=2, max_rotation_degrees=15,
-                                 crop_scale_range=(0.8, 1.0), noise_std_range=(0.0, 0.03))
+    prep_cfg = PreparationConfig(target_sizes=(384,), normalization_mode="zero_one", compute_high_pass=True)
+    augment_cfg = AugmentationConfig(enable=True, copies_per_sample=2, max_rotation_degrees=15,
+                                     crop_scale_range=(0.8, 1.0), noise_std_range=(0.0, 0.03))
 
-    pipeline = DataPreparationPipeline(structure, split, prep, augment)
-    manifest_df = pipeline.prepare()
-    print("Preparation finished.")
-    if not manifest_df.empty:
-        for split_name, count in manifest_df.groupby("split").size().items():
-            print(f"{split_name}: {count} artifacts")
+    combined_dfs = []
+    prepared_roots = []
+    for ds in datasets:
+        print(f"Preparing dataset '{ds.dataset_name}'...")
+        split_cfg = per_dataset_splits.get(ds.dataset_name, SplitConfig())
+        pipeline = DataPreparationPipeline(ds, split_cfg, prep_cfg, augment_cfg)
+        df = pipeline.prepare()
+        prepared_root = ds.prepared_path()
+        prepared_roots.append(str(prepared_root))
+        if not df.empty:
+            df = df.copy()
+            df["dataset"] = ds.dataset_name
+            df["prepared_root"] = str(prepared_root)
+            combined_dfs.append(df)
+
+    # Write a combined manifest if any dataset produced artifacts
+    if combined_dfs:
+        combined = pd.concat(combined_dfs, ignore_index=True)
+        # Choose a combined parent: prefer the common parent of all prepared roots
+        parents = {str(Path(p).parent) for p in prepared_roots}
+        if len(parents) == 1:
+            combined_parent = Path(next(iter(parents)))
+        else:
+            combined_parent = Path(prepared_roots[0]).parent
+        combined_path = combined_parent / "combined_manifest.parquet"
+        combined.to_parquet(combined_path, index=False)
+        print(f"Wrote combined manifest to {combined_path}")
+    else:
+        print("No artifacts generated for the provided datasets.")
