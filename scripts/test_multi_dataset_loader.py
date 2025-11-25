@@ -24,12 +24,16 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from data.data_preparation import PreparedForgeryDataset, EvenMultiSourceBatchSampler
+from data.data_preparation import (
+    PreparedForgeryDataset,
+    EvenMultiSourceBatchSampler,
+    EvenMultiSourceBalancedSampler,
+)
 from train import TrainConfig, Trainer
 from model.hybrid_forgery_detector import HybridForgeryConfig
 
 
-def make_simple_npz(path: Path, label: str, target_size: int = 384):
+def make_simple_npz(path: Path, label: str, target_size: int = 320):
     path.parent.mkdir(parents=True, exist_ok=True)
     H = W = target_size
     img = (np.random.rand(H, W, 3).astype(np.float32)).astype(np.float32)
@@ -66,13 +70,13 @@ def prepare_test_roots(base: Path):
         for i in range(2):
             label = "fake" if i % 2 == 0 else "real"
             rel_dir = Path("train") / label
-            filename = f"sample_{i}_{384}px_orig.npz"
+            filename = f"sample_{i}_{320}px_orig.npz"
             rel_path = str(rel_dir / filename)
             full_path = root / rel_path
-            make_simple_npz(full_path, label, target_size=384)
+            make_simple_npz(full_path, label, target_size=320)
             rec = {
                 "split": "train",
-                "target_size": 384,
+                "target_size": 320,
                 "relative_path": rel_path.replace("\\", "/"),
                 "tar_path": None,
                 "tar_member": filename,
@@ -100,7 +104,7 @@ def run_checks():
         print(" -", r)
 
     # Test PreparedForgeryDataset with multiple roots
-    ds = PreparedForgeryDataset(prepared_root=[str(roots[0]), str(roots[1])], split="train", target_size=384)
+    ds = PreparedForgeryDataset(prepared_root=[str(roots[0]), str(roots[1])], split="train", target_size=320)
     assert len(ds) >= 4, "Expected at least 4 records across both roots"
     print("PreparedForgeryDataset loaded records:", len(ds))
 
@@ -112,7 +116,7 @@ def run_checks():
     # Build a Trainer that uses these prepared roots and check the train_loader
     cfg = TrainConfig()
     cfg.prepared_root = [str(roots[0]), str(roots[1])]
-    cfg.target_size = 384
+    cfg.target_size = 320
     cfg.batch_size = 4
     cfg.num_workers = 0
     cfg.device = "cpu"
@@ -128,8 +132,10 @@ def run_checks():
         # In some PyTorch versions DataLoader may expose sampler instead
         bs = getattr(loader, "sampler", None)
 
-    assert isinstance(bs, EvenMultiSourceBatchSampler), f"Expected EvenMultiSourceBatchSampler, got {type(bs)}"
-    print("Trainer is using EvenMultiSourceBatchSampler for multi-source batching.")
+    assert isinstance(
+        bs, (EvenMultiSourceBatchSampler, EvenMultiSourceBalancedSampler)
+    ), f"Expected multi-source batch sampler, got {type(bs)}"
+    print("Trainer is using a multi-source batch sampler for multi-source batching.")
 
     # Clean up
     shutil.rmtree(base)

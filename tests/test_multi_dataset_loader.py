@@ -9,7 +9,7 @@ from train import TrainConfig, Trainer
 from model.hybrid_forgery_detector import HybridForgeryConfig
 
 
-def _make_simple_npz(path: Path, label: str, target_size: int = 384):
+def _make_simple_npz(path: Path, label: str, target_size: int = 320):
     path.parent.mkdir(parents=True, exist_ok=True)
     H = W = target_size
     img = (np.random.rand(H, W, 3).astype(np.float32)).astype(np.float32)
@@ -43,13 +43,13 @@ def _prepare_test_roots(base: Path):
         for i in range(2):
             label = "fake" if i % 2 == 0 else "real"
             rel_dir = Path("train") / label
-            filename = f"sample_{i}_{384}px_orig.npz"
+            filename = f"sample_{i}_{320}px_orig.npz"
             rel_path = str(rel_dir / filename)
             full_path = root / rel_path
-            _make_simple_npz(full_path, label, target_size=384)
+            _make_simple_npz(full_path, label, target_size=320)
             rec = {
                 "split": "train",
-                "target_size": 384,
+                "target_size": 320,
                 "relative_path": rel_path.replace("\\", "/"),
                 "tar_path": None,
                 "tar_member": filename,
@@ -70,7 +70,7 @@ def test_multi_dataset_loader_and_trainer(tmp_path):
     roots = _prepare_test_roots(base)
 
     # PreparedForgeryDataset should load records from both roots
-    ds = PreparedForgeryDataset(prepared_root=[str(roots[0]), str(roots[1])], split="train", target_size=384)
+    ds = PreparedForgeryDataset(prepared_root=[str(roots[0]), str(roots[1])], split="train", target_size=320)
     assert len(ds) >= 4
     prepared_roots_in_records = {rec.get("prepared_root") for rec in ds.records}
     assert len(prepared_roots_in_records) == 2
@@ -78,7 +78,7 @@ def test_multi_dataset_loader_and_trainer(tmp_path):
     # Trainer should use EvenMultiSourceBatchSampler when multiple prepared roots present
     cfg = TrainConfig()
     cfg.prepared_root = [str(roots[0]), str(roots[1])]
-    cfg.target_size = 384
+    cfg.target_size = 320
     cfg.batch_size = 4
     cfg.num_workers = 0
     cfg.device = "cpu"

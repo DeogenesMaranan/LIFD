@@ -40,7 +40,7 @@ class TrainConfig:
     """
 
     prepared_root: str | Sequence[str] = "prepared/CASIA2"
-    target_size: int = 384
+    target_size: int = 320
     train_split: str = "train"
     val_split: str = "val"
     batch_size: int = 8

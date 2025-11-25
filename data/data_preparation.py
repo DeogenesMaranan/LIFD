@@ -93,7 +93,7 @@ class AugmentationConfig:
 
 @dataclass
 class PreparationConfig:
-    target_sizes: Tuple[int, ...] = (384,)
+    target_sizes: Tuple[int, ...] = (320,)
     normalization_mode: str = "zero_one"
     compute_high_pass: bool = True
     gaussian_radius: float = 1.0
@@ -945,7 +945,7 @@ if __name__ == "__main__":
         "coverage": SplitConfig(train=0.0, val=0.0, test=1.0, seed=4),
     }
 
-    prep_cfg = PreparationConfig(target_sizes=(384,), normalization_mode="zero_one", compute_high_pass=True)
+    prep_cfg = PreparationConfig(target_sizes=(320,), normalization_mode="zero_one", compute_high_pass=True)
     augment_cfg = AugmentationConfig(enable=True, copies_per_sample=2, max_rotation_degrees=15,
                                      crop_scale_range=(0.8, 1.0), noise_std_range=(0.0, 0.03))
 

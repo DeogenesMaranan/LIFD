@@ -1,8 +1,8 @@
 """Utility to compute model parameter counts and approximate FLOPs.
 
 Usage examples:
-  python -m scripts.model_stats --input-size 3 384 384
-  python -m scripts.model_stats --checkpoint path/to/checkpoint.pt --input-size 3 384 384
+    python -m scripts.model_stats --input-size 3 320 320
+    python -m scripts.model_stats --checkpoint path/to/checkpoint.pt --input-size 3 320 320
 
 The script will try to use `thop` first, then `ptflops`.
 If neither is available it will still print parameter counts and advise installing one of them.
@@ -124,7 +124,7 @@ def build_default_model(device: str = "cpu") -> torch.nn.Module:
 
 def _parse_input_size(args_input) -> Tuple[int, ...]:
     if not args_input:
-        return (3, 384, 384)
+        return (3, 320, 320)
     values = tuple(int(x) for x in args_input)
     return values
 
@@ -133,7 +133,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Compute model parameters and FLOPs for the HybridForgeryDetector")
     p.add_argument("--checkpoint", type=str, help="Optional checkpoint path to load model weights from")
     p.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
-    p.add_argument("--input-size", nargs="*", help="Input channel and spatial size, e.g. --input-size 3 384 384")
+    p.add_argument("--input-size", nargs="*", help="Input channel and spatial size, e.g. --input-size 3 320 320")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 

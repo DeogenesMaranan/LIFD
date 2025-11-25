@@ -34,7 +34,7 @@ class HybridForgeryConfig:
     noise_branch_use_high_pass: bool = True
     use_boundary_refiner: bool = True
     boundary_refiner_channels: int = 64
-    backbone_input_size: int | tuple[int, int] = 384
+    backbone_input_size: int | tuple[int, int] = 320
     gradient_checkpointing: bool = False
 
 
@@ -58,7 +58,10 @@ class HybridForgeryDetector(nn.Module):
         backbone_channels: Dict[str, List[int]] = {}
 
         if self.config.use_efficientnet:
-            eff = EfficientNetB0Backbone(pretrained=self.config.pretrained_backbones)
+            eff = EfficientNetB0Backbone(
+                pretrained=self.config.pretrained_backbones,
+                input_size=self.config.backbone_input_size,
+            )
             self.backbones["efficientnet"] = eff
             backbone_channels["efficientnet"] = eff.feature_dims
 
@@ -71,7 +74,10 @@ class HybridForgeryDetector(nn.Module):
             backbone_channels["swin"] = swin.feature_dims
 
         if self.config.use_segformer:
-            segformer = SegFormerMiTBackbone(pretrained=self.config.pretrained_backbones)
+            segformer = SegFormerMiTBackbone(
+                pretrained=self.config.pretrained_backbones,
+                input_size=self.config.backbone_input_size,
+            )
             self.backbones["segformer"] = segformer
             backbone_channels["segformer"] = segformer.feature_dims
 
