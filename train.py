@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+from datetime import datetime
 from torch import amp
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
@@ -62,6 +64,7 @@ class TrainConfig:
     max_train_batches: Optional[int] = None
     max_val_batches: Optional[int] = None
     resume_from: Optional[str] = None
+    auto_continue_latest: bool = True
     include_aux_features: Optional[bool] = None
     loss_config: LossConfig = field(default_factory=LossConfig)
     balance_real_fake: bool = True
@@ -129,8 +132,18 @@ class Trainer:
         self.best_val_loss = math.inf
         self._epochs_without_improvement = 0
         self.start_epoch = 1
+        # Priority: explicit `resume_from` wins. Otherwise, if configured,
+        # automatically continue from the latest epoch checkpoint found in
+        # the checkpoint directory.
         if self.config.resume_from:
             self.start_epoch = self._load_checkpoint(self.config.resume_from)
+        elif getattr(self.config, "auto_continue_latest", False):
+            latest = self._find_latest_epoch_checkpoint()
+            if latest is not None:
+                try:
+                    self.start_epoch = self._load_checkpoint(str(latest))
+                except Exception as exc:
+                    print(f"Failed to auto-load latest checkpoint '{latest}': {exc}")
 
     def _build_dataloader(self, split: str, shuffle: bool) -> DataLoader:
         dataset = PreparedForgeryDataset(
@@ -519,6 +532,64 @@ class Trainer:
         if is_best or not self.config.save_best_only:
             best_path = self.checkpoint_dir / "best.pt"
             torch.save(checkpoint, best_path)
+        # Append this epoch's metrics into a single `metrics.json` file that
+        # contains an array of epoch records. This keeps a compact history in
+        # one file rather than many per-epoch files.
+        try:
+            metrics_record = {
+                "epoch": epoch,
+                "val_metrics": val_metrics,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+            history_path = self.checkpoint_dir / "metrics.json"
+            history: List[Dict[str, Any]] = []
+            if history_path.exists():
+                try:
+                    with history_path.open("r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                    # If existing is a dict (old format), coerce to list
+                    if isinstance(existing, list):
+                        history = existing
+                    elif isinstance(existing, dict):
+                        history = [existing]
+                    else:
+                        history = []
+                except Exception:
+                    # If file is unreadable, start fresh but don't crash
+                    history = []
+            history.append(metrics_record)
+            # Write atomically: write to a temp file then replace
+            tmp_path = self.checkpoint_dir / "metrics.json.tmp"
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+            try:
+                tmp_path.replace(history_path)
+            except Exception:
+                # Fallback to non-atomic write on failure
+                with history_path.open("w", encoding="utf-8") as f:
+                    json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"Warning: failed to append metrics JSON for epoch {epoch}: {exc}")
+
+    def _find_latest_epoch_checkpoint(self) -> Optional[Path]:
+        # Look for files named like `epoch_###.pt` and return the path to the
+        # checkpoint with the highest epoch number, or None if none found.
+        candidates = []
+        try:
+            for p in self.checkpoint_dir.iterdir():
+                if p.is_file() and p.name.startswith("epoch_") and p.suffix == ".pt":
+                    # filename like epoch_001.pt
+                    try:
+                        num = int(p.stem.split("_")[-1])
+                        candidates.append((num, p))
+                    except Exception:
+                        continue
+        except Exception:
+            return None
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[-1][1]
 
     def _load_checkpoint(self, checkpoint_path: str) -> int:
         path = Path(checkpoint_path)
