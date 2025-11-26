@@ -647,15 +647,35 @@ class PreparedForgeryDataset(TorchDataset):
                         p = Path(pr_value)
                     except Exception:
                         return str(combined_manifest_path.parent)
-                    # Absolute and exists -> keep
+                    manifest_parent = combined_manifest_path.parent
+                    # Absolute path: keep only if it exists; otherwise fall back
                     if p.is_absolute():
-                        return str(p) if p.exists() else str(combined_manifest_path.parent)
-                    # Relative -> try manifest_parent / relative
-                    candidate = combined_manifest_path.parent / p
+                        return str(p) if p.exists() else str(manifest_parent)
+
+                    # If manifest contains a common "prepared/<dataset>" layout,
+                    # try to map that to the snapshot-local dataset directory.
+                    # e.g. 'prepared/CASIA2' -> '<snapshot_parent>/CASIA2'
+                    parts = [part for part in p.parts if part]
+                    if parts and parts[0].lower() == "prepared" and len(parts) >= 2:
+                        dataset_name = parts[1]
+                        candidate_alt = manifest_parent / dataset_name
+                        if candidate_alt.exists():
+                            return str(candidate_alt)
+
+                    # General relative -> try manifest_parent / relative
+                    candidate = manifest_parent / p
                     if candidate.exists():
                         return str(candidate)
+
+                    # As a last attempt, try manifest_parent / last_name
+                    last_name = p.name
+                    if last_name:
+                        candidate_last = manifest_parent / last_name
+                        if candidate_last.exists():
+                            return str(candidate_last)
+
                     # Last resort: manifest parent
-                    return str(combined_manifest_path.parent)
+                    return str(manifest_parent)
 
                 combined_df["prepared_root"] = combined_df["prepared_root"].apply(_rebase_pr)
             dfs.append(combined_df)
