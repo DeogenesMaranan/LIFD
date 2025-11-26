@@ -63,7 +63,7 @@ class TrainConfig:
     use_amp: bool = True
     use_channels_last: bool = True
     use_torch_compile: bool = True
-    torch_compile_backend: Optional[str] = "inductor"
+    torch_compile_backend: Optional[str] = None
     max_train_batches: Optional[int] = None
     max_val_batches: Optional[int] = None
     resume_from: Optional[str] = None
