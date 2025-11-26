@@ -79,12 +79,15 @@ class SplitConfig:
 @dataclass
 class AugmentationConfig:
     enable: bool = True
-    copies_per_sample: int = 1
-    enable_flips: bool = True
-    enable_rotations: bool = True
-    enable_random_crop: bool = True
-    enable_color_jitter: bool = True
-    enable_noise: bool = True
+    # Keep augmentation minimal by default to limit storage usage.
+    # `copies_per_sample` controls how many augmented variants are produced
+    # in addition to the original. Set to 0 to produce only the original.
+    copies_per_sample: int = 0
+    enable_flips: bool = False
+    enable_rotations: bool = False
+    enable_random_crop: bool = False
+    enable_color_jitter: bool = False
+    enable_noise: bool = False
     max_rotation_degrees: float = 10.0
     crop_scale_range: Tuple[float, float] = (0.9, 1.0)
     color_jitter_factors: Tuple[float, float] = (0.9, 1.1)
@@ -146,9 +149,13 @@ class DataPreparationPipeline:
         self._prepared_root.mkdir(parents=True, exist_ok=True)
         self._sample_counter = 0
         self._last_sample_log = self._prepared_root / "last_sample.log"
+        # Track how many fake samples were skipped because they lacked masks
+        self._skipped_no_mask = 0
 
     def prepare(self) -> pd.DataFrame:
         samples_by_label = self._collect_samples()
+        if getattr(self, "_skipped_no_mask", 0) > 0:
+            print(f"Skipped {self._skipped_no_mask} fake samples without masks in {self.structure.as_path()}")
         split_map = self._split_samples(samples_by_label)
         manifest_entries: List[Dict[str, Any]] = []
 
@@ -218,6 +225,28 @@ class DataPreparationPipeline:
 
         split_counts = manifest_df.groupby("split").size().to_dict() if not manifest_df.empty else {}
         print("Artifacts per split:", split_counts)
+
+        # Write a small JSON summary with counts to help estimate storage
+        # and for bookkeeping. This includes the number of input samples
+        # scanned, number of generated artifacts, number skipped due to
+        # missing masks, and per-split artifact counts.
+        try:
+            summary = {
+                "prepared_root": str(self._prepared_root),
+                "total_input_samples": total_samples,
+                "generated_artifacts": len(manifest_entries),
+                "skipped_no_mask": int(getattr(self, "_skipped_no_mask", 0)),
+                "artifacts_per_split": {k: int(v) for k, v in split_counts.items()},
+            }
+            summary_path = self._prepared_root / "prepare_summary.json"
+            with open(summary_path, "w", encoding="utf-8") as fh:
+                import json as _json
+
+                _json.dump(summary, fh, indent=2)
+            print(f"Wrote preparation summary to {summary_path}")
+        except Exception:
+            # Non-fatal: don't stop the pipeline for summary write errors
+            pass
 
         return manifest_df
 
@@ -298,12 +327,21 @@ class DataPreparationPipeline:
         mask_dir = dataset_path / self.structure.mask_subdir
 
         samples: Dict[str, List[SampleRecord]] = {"real": [], "fake": []}
+        # Reset skipped counter once per dataset
+        self._skipped_no_mask = 0
 
+        # Collect real images
         for image_path in self._iter_images(real_dir):
             samples["real"].append(SampleRecord(image_path=image_path, mask_path=None, label="real"))
 
+        # Collect fake images, skipping entries without masks
         for image_path in self._iter_images(fake_dir):
             mask_path = self._resolve_mask_path(mask_dir, image_path)
+            # Skip tampered samples that do not have an associated mask
+            # (user requested to exclude these from the prepared dataset).
+            if mask_path is None:
+                self._skipped_no_mask += 1
+                continue
             samples["fake"].append(SampleRecord(image_path=image_path, mask_path=mask_path, label="fake"))
 
         if not samples["real"] and not samples["fake"]:
@@ -335,9 +373,33 @@ class DataPreparationPipeline:
             total = len(shuffled)
             if total == 0:
                 continue
-            train_count = int(total * self.split.train)
-            val_count = int(total * self.split.val)
-            test_count = max(0, total - train_count - val_count)
+            # Compute per-split counts using floor (int) then distribute any
+            # leftover samples (due to rounding) only to splits that have a
+            # non-zero proportion. This prevents a configured 0.0 split
+            # from receiving remainder samples.
+            train_prop = float(self.split.train)
+            val_prop = float(self.split.val)
+            test_prop = float(self.split.test)
+
+            counts = [int(total * train_prop), int(total * val_prop), int(total * test_prop)]
+            rem = total - sum(counts)
+
+            props = [train_prop, val_prop, test_prop]
+            # If all proportions are zero (shouldn't happen), put everything in train
+            if all(p == 0.0 for p in props):
+                counts = [total, 0, 0]
+                rem = 0
+
+            idx = 0
+            # Distribute remainder round-robin but only to splits with prop>0
+            while rem > 0:
+                target = idx % 3
+                if props[target] > 0.0:
+                    counts[target] += 1
+                    rem -= 1
+                idx += 1
+
+            train_count, val_count, test_count = counts
             split_map["train"].extend(shuffled[:train_count])
             split_map["val"].extend(shuffled[train_count:train_count + val_count])
             split_map["test"].extend(shuffled[train_count + val_count:train_count + val_count + test_count])
@@ -910,8 +972,8 @@ if __name__ == "__main__":
     """
     datasets = [
         DatasetStructureConfig(
-            dataset_root="./datasets/CASIA2",
-            dataset_name="casia",
+            dataset_root="./datasets",
+            dataset_name="CASIA2",
             real_subdir="real",
             fake_subdir="fake",
             mask_subdir="mask",
@@ -919,8 +981,8 @@ if __name__ == "__main__":
             prepared_root="prepared",
         ),
         DatasetStructureConfig(
-            dataset_root="./datasets/FantasticReality",
-            dataset_name="fantastic_reality",
+            dataset_root="./datasets",
+            dataset_name="FantasticReality",
             real_subdir="ColorRealImages",
             fake_subdir="ColorFakeImages",
             mask_subdir="masks",
@@ -928,8 +990,8 @@ if __name__ == "__main__":
             prepared_root="prepared",
         ),
         DatasetStructureConfig(
-            dataset_root="./datasets/COVERAGE",
-            dataset_name="coverage",
+            dataset_root="./datasets",
+            dataset_name="COVERAGE",
             real_subdir="real",
             fake_subdir="fake",
             mask_subdir="mask",
@@ -940,14 +1002,27 @@ if __name__ == "__main__":
 
     # Per-dataset split configs (honour dataset-specific seeds)
     per_dataset_splits = {
-        "casia": SplitConfig(train=0.8, val=0.2, test=0.0, seed=6),
-        "fantastic_reality": SplitConfig(train=0.8, val=0.2, test=0.0, seed=10),
-        "coverage": SplitConfig(train=0.0, val=0.0, test=1.0, seed=4),
+        "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=6),
+        "FantasticReality": SplitConfig(train=0.8, val=0.2, test=0.0, seed=10),
+        "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=4),
     }
 
+    # Example preparation + augmentation configuration tuned to keep
+    # storage low while retaining a single influential augmentation.
+    # We produce one augmented variant per sample using a random crop
+    # (scale jitter). Other augmentations are disabled to avoid extra files.
     prep_cfg = PreparationConfig(target_sizes=(320,), normalization_mode="zero_one", compute_high_pass=True)
-    augment_cfg = AugmentationConfig(enable=True, copies_per_sample=2, max_rotation_degrees=15,
-                                     crop_scale_range=(0.8, 1.0), noise_std_range=(0.0, 0.03))
+    augment_cfg = AugmentationConfig(
+        enable=True,
+        copies_per_sample=1,
+        enable_flips=True,
+        enable_rotations=False,
+        enable_random_crop=False,
+        enable_color_jitter=False,
+        enable_noise=False,
+        max_rotation_degrees=0,
+        crop_scale_range=(0.9, 1.0),
+    )
 
     combined_dfs = []
     prepared_roots = []
