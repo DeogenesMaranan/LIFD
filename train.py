@@ -64,6 +64,8 @@ class TrainConfig:
     use_channels_last: bool = True
     use_torch_compile: bool = True
     torch_compile_backend: Optional[str] = None
+    # Prefetch batches and move them to device asynchronously
+    use_data_prefetch: bool = True
     max_train_batches: Optional[int] = None
     max_val_batches: Optional[int] = None
     resume_from: Optional[str] = None
@@ -258,6 +260,63 @@ class Trainer:
 
         return DataLoader(dataset, **loader_kwargs)
 
+
+class DataPrefetcher:
+    """Simple prefetcher that moves batches to `device` on a separate CUDA stream.
+
+    It expects the underlying DataLoader to yield CPU tensors. The prefetcher
+    will move tensors (and optionally convert them to channels-last) so the
+    training loop can consume already-device-resident batches.
+    """
+
+    def __init__(self, loader, device: torch.device, use_channels_last: bool = False):
+        self.loader = iter(loader)
+        self.device = device
+        self.use_channels_last = use_channels_last
+        self.stream = torch.cuda.Stream() if self.device.type == "cuda" else None
+        self.next_batch = None
+        self._preload()
+
+    def _to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                if self.use_channels_last and k in ("image", "high_pass", "residual") and v.ndim == 4:
+                    batch[k] = v.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+                else:
+                    batch[k] = v.to(self.device, non_blocking=True).contiguous()
+        return batch
+
+    def _preload(self):
+        try:
+            batch = next(self.loader)
+        except StopIteration:
+            self.next_batch = None
+            return
+        if self.stream is None:
+            self.next_batch = self._to_device(batch)
+            return
+        # Move to device on the prefetch stream
+        with torch.cuda.stream(self.stream):
+            self.next_batch = self._to_device(batch)
+
+    def next(self) -> Optional[Dict[str, Any]]:
+        if self.stream is not None:
+            # Ensure current stream waits for preload stream copy
+            torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self.next_batch
+        if batch is None:
+            return None
+        # Kick off loading of the next batch
+        self._preload()
+        return batch
+
+    def __iter__(self):
+        while True:
+            batch = self.next()
+            if batch is None:
+                break
+            yield batch
+
     def _build_balanced_sampler(self, dataset: PreparedForgeryDataset) -> Optional[WeightedRandomSampler]:
         labels = getattr(dataset, "sample_labels", None)
         if not labels:
@@ -444,14 +503,24 @@ class Trainer:
         running_loss = 0.0
         total_steps = len(self.train_loader)
         iterator = self.train_loader
-        if tqdm:
-            iterator = tqdm(iterator, desc=f"Epoch {epoch} [train]", leave=False)
+        use_prefetch = getattr(self.config, "use_data_prefetch", False) and self.device.type == "cuda"
+        prefetcher = None
+        if use_prefetch:
+            # Use DataPrefetcher (already moves tensors to device); skip _prepare_batch
+            prefetcher = DataPrefetcher(self.train_loader, self.device, use_channels_last=self._use_channels_last)
+            iterator = prefetcher
+        else:
+            iterator = self.train_loader
+            if tqdm:
+                iterator = tqdm(iterator, desc=f"Epoch {epoch} [train]", leave=False)
         steps_completed = 0
         accum_target = max(1, self.config.grad_accumulation_steps)
         accum_counter = 0
         self.optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(iterator, start=1):
-            batch = self._prepare_batch(batch)
+            # If prefetcher moved tensors to device already, avoid double-moving
+            if prefetcher is None:
+                batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
             noise_inputs = self._extract_noise_inputs(batch)
             with self._autocast():
