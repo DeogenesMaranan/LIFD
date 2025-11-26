@@ -61,6 +61,9 @@ class TrainConfig:
     checkpoint_interval: int = 1
     save_best_only: bool = True
     use_amp: bool = True
+    use_channels_last: bool = True
+    use_torch_compile: bool = True
+    torch_compile_backend: Optional[str] = "inductor"
     max_train_batches: Optional[int] = None
     max_val_batches: Optional[int] = None
     resume_from: Optional[str] = None
@@ -88,7 +91,17 @@ class Trainer:
     def __init__(self, config: TrainConfig) -> None:
         self.config = config
         self.device = config.resolved_device()
-        self.model = HybridForgeryDetector(config.model_config).to(self.device)
+        model = HybridForgeryDetector(config.model_config)
+        try:
+            if config.use_channels_last and self.device.type == "cuda":
+                self.model = model.to(self.device, memory_format=torch.channels_last)
+                self._use_channels_last = True
+            else:
+                self.model = model.to(self.device)
+                self._use_channels_last = False
+        except Exception:
+            self.model = model.to(self.device)
+            self._use_channels_last = False
         self.loss_fn = CombinedSegmentationLoss(config.loss_config).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
@@ -126,6 +139,40 @@ class Trainer:
 
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if self.device.type == "cuda":
+                try:
+                    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                        if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+                            torch.backends.cuda.matmul.fp32_precision = "tf32"
+                            print("Enabled torch.backends.cuda.matmul.fp32_precision='tf32'")
+                        elif hasattr(torch, "set_float32_matmul_precision"):
+                            torch.set_float32_matmul_precision("high")
+                            print("Called torch.set_float32_matmul_precision('high') (fallback)")
+                except Exception:
+                    pass
+
+                try:
+                    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "conv"):
+                        if hasattr(torch.backends.cudnn.conv, "fp32_precision"):
+                            torch.backends.cudnn.conv.fp32_precision = "tf32"
+                            print("Enabled torch.backends.cudnn.conv.fp32_precision='tf32'")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if getattr(config, "use_torch_compile", False):
+            try:
+                compile_kwargs = {}
+                backend = getattr(config, "torch_compile_backend", None)
+                if backend:
+                    compile_kwargs["backend"] = backend
+                if hasattr(torch, "compile"):
+                    self.model = torch.compile(self.model, **compile_kwargs)
+            except Exception as exc:
+                print(f"Warning: torch.compile failed or unavailable: {exc}")
 
         self.train_loader = self._build_dataloader(config.train_split, shuffle=True)
         try:
@@ -266,7 +313,13 @@ class Trainer:
         prepared: Dict[str, Any] = {}
         for key, value in batch.items():
             if torch.is_tensor(value):
-                prepared[key] = value.to(self.device, non_blocking=True)
+                if self._use_channels_last and key in ("image", "high_pass", "residual"):
+                    prepared[key] = (
+                        value.to(self.device, non_blocking=True)
+                        .contiguous(memory_format=torch.channels_last)
+                    )
+                else:
+                    prepared[key] = value.to(self.device, non_blocking=True).contiguous()
             else:
                 prepared[key] = value
         return prepared
