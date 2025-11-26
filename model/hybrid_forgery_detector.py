@@ -185,10 +185,18 @@ class HybridForgeryDetector(nn.Module):
         threshold: float | None = None,
         noise_features: Dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """Return raw logits by default. If `threshold` is provided, apply
+        sigmoid to convert logits to probabilities and return a thresholded
+        binary mask.
+
+        This keeps the model output as logits (no sigmoid) for training and
+        downstream losses that expect logits, while still supporting
+        convenience thresholding for evaluation or inference code.
+        """
         logits = self.forward(x, noise_features=noise_features)
-        probs = torch.sigmoid(logits)
         if threshold is None:
-            return probs
+            return logits
+        probs = torch.sigmoid(logits)
         return (probs > threshold).float()
 
     def _resolve_noise_inputs(
