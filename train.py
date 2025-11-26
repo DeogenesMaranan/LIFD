@@ -281,63 +281,6 @@ class Trainer:
             )
         return None
 
-
-class DataPrefetcher:
-    """Simple prefetcher that moves batches to `device` on a separate CUDA stream.
-
-    It expects the underlying DataLoader to yield CPU tensors. The prefetcher
-    will move tensors (and optionally convert them to channels-last) so the
-    training loop can consume already-device-resident batches.
-    """
-
-    def __init__(self, loader, device: torch.device, use_channels_last: bool = False):
-        self.loader = iter(loader)
-        self.device = device
-        self.use_channels_last = use_channels_last
-        self.stream = torch.cuda.Stream() if self.device.type == "cuda" else None
-        self.next_batch = None
-        self._preload()
-
-    def _to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        for k, v in list(batch.items()):
-            if torch.is_tensor(v):
-                if self.use_channels_last and k in ("image", "high_pass", "residual") and v.ndim == 4:
-                    batch[k] = v.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-                else:
-                    batch[k] = v.to(self.device, non_blocking=True).contiguous()
-        return batch
-
-    def _preload(self):
-        try:
-            batch = next(self.loader)
-        except StopIteration:
-            self.next_batch = None
-            return
-        if self.stream is None:
-            self.next_batch = self._to_device(batch)
-            return
-        # Move to device on the prefetch stream
-        with torch.cuda.stream(self.stream):
-            self.next_batch = self._to_device(batch)
-
-    def next(self) -> Optional[Dict[str, Any]]:
-        if self.stream is not None:
-            # Ensure current stream waits for preload stream copy
-            torch.cuda.current_stream().wait_stream(self.stream)
-        batch = self.next_batch
-        if batch is None:
-            return None
-        # Kick off loading of the next batch
-        self._preload()
-        return batch
-
-    def __iter__(self):
-        while True:
-            batch = self.next()
-            if batch is None:
-                break
-            yield batch
-
     def _build_balanced_sampler(self, dataset: PreparedForgeryDataset) -> Optional[WeightedRandomSampler]:
         labels = getattr(dataset, "sample_labels", None)
         if not labels:
@@ -417,20 +360,8 @@ class DataPrefetcher:
                 noise[key] = tensor
         return noise or None
 
-    def _build_scheduler(self):
-        sched_type = (self.config.lr_scheduler_type or "").lower()
-        if sched_type == "plateau":
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer,
-                factor=self.config.lr_scheduler_factor,
-                patience=self.config.lr_scheduler_patience,
-            )
-        if sched_type == "cosine":
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=self.config.num_epochs,
-            )
-        return None
+
+
 
     def _step_scheduler(self, metric: float) -> None:
         if not self.scheduler:
@@ -819,6 +750,62 @@ class DataPrefetcher:
         if best_threshold is not None:
             best_summary.update(metrics_by_threshold[best_threshold])
         return metrics_by_threshold, best_summary
+
+class DataPrefetcher:
+    """Simple prefetcher that moves batches to `device` on a separate CUDA stream.
+
+    It expects the underlying DataLoader to yield CPU tensors. The prefetcher
+    will move tensors (and optionally convert them to channels-last) so the
+    training loop can consume already-device-resident batches.
+    """
+
+    def __init__(self, loader, device: torch.device, use_channels_last: bool = False):
+        self.loader = iter(loader)
+        self.device = device
+        self.use_channels_last = use_channels_last
+        self.stream = torch.cuda.Stream() if self.device.type == "cuda" else None
+        self.next_batch = None
+        self._preload()
+
+    def _to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in list(batch.items()):
+            if torch.is_tensor(v):
+                if self.use_channels_last and k in ("image", "high_pass", "residual") and v.ndim == 4:
+                    batch[k] = v.to(self.device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+                else:
+                    batch[k] = v.to(self.device, non_blocking=True).contiguous()
+        return batch
+
+    def _preload(self):
+        try:
+            batch = next(self.loader)
+        except StopIteration:
+            self.next_batch = None
+            return
+        if self.stream is None:
+            self.next_batch = self._to_device(batch)
+            return
+        # Move to device on the prefetch stream
+        with torch.cuda.stream(self.stream):
+            self.next_batch = self._to_device(batch)
+
+    def next(self) -> Optional[Dict[str, Any]]:
+        if self.stream is not None:
+            # Ensure current stream waits for preload stream copy
+            torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self.next_batch
+        if batch is None:
+            return None
+        # Kick off loading of the next batch
+        self._preload()
+        return batch
+
+    def __iter__(self):
+        while True:
+            batch = self.next()
+            if batch is None:
+                break
+            yield batch
 
 
 def run_training(config: TrainConfig) -> Dict[str, List[float]]:
