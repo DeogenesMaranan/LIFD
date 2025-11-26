@@ -633,6 +633,31 @@ class PreparedForgeryDataset(TorchDataset):
             if "prepared_root" not in combined_df.columns:
                 # If not present, assume relative paths are relative to the manifest parent
                 combined_df["prepared_root"] = str(combined_manifest_path.parent)
+            else:
+                # Normalize / rebase prepared_root entries so they resolve inside
+                # the environment where the manifest was loaded. Manifests created
+                # on a different machine may contain relative paths like
+                # 'prepared/CASIA2' which won't exist on the current host. For
+                # each entry, prefer an existing absolute path; otherwise try to
+                # rebase the (possibly relative) path under the manifest's
+                # parent directory. If that still doesn't exist, fall back to
+                # the manifest parent directory itself.
+                def _rebase_pr(pr_value):
+                    try:
+                        p = Path(pr_value)
+                    except Exception:
+                        return str(combined_manifest_path.parent)
+                    # Absolute and exists -> keep
+                    if p.is_absolute():
+                        return str(p) if p.exists() else str(combined_manifest_path.parent)
+                    # Relative -> try manifest_parent / relative
+                    candidate = combined_manifest_path.parent / p
+                    if candidate.exists():
+                        return str(candidate)
+                    # Last resort: manifest parent
+                    return str(combined_manifest_path.parent)
+
+                combined_df["prepared_root"] = combined_df["prepared_root"].apply(_rebase_pr)
             dfs.append(combined_df)
 
         for root in roots:
