@@ -725,6 +725,14 @@ class PreparedForgeryDataset(TorchDataset):
 
         if record.get("tar_path"):
             tar_path = Path(record.get("prepared_root", ".")) / record["tar_path"]
+            # If the tar path doesn't exist, try inserting the dataset name
+            # between the prepared_root and tar_path (common combined-manifest layout).
+            if not tar_path.exists():
+                dataset_name = record.get("dataset")
+                if dataset_name:
+                    alt = Path(record.get("prepared_root", ".")) / dataset_name / record["tar_path"]
+                    if alt.exists():
+                        tar_path = alt
             tar = self._get_tar_handle(tar_path)
             member_name = record["tar_member"]
             member = tar.extractfile(member_name)
@@ -741,6 +749,13 @@ class PreparedForgeryDataset(TorchDataset):
             if not rel_path:
                 raise FileNotFoundError("Record is missing both tar_path and relative_path.")
             npz_path = Path(record.get("prepared_root", ".")) / rel_path
+            # If not found, try inserting the dataset name as an intermediate
+            if not npz_path.exists():
+                dataset_name = record.get("dataset")
+                if dataset_name:
+                    alt_npz = Path(record.get("prepared_root", ".")) / dataset_name / rel_path
+                    if alt_npz.exists():
+                        npz_path = alt_npz
             npz_source = np.load(npz_path, allow_pickle=True)
 
         with npz_source as data:
@@ -773,6 +788,8 @@ class PreparedForgeryDataset(TorchDataset):
         key = str(tar_path.resolve())
         handle = self._tar_cache.get(key)
         if handle is None:
+            if not tar_path.exists():
+                raise FileNotFoundError(f"Tar shard not found: '{tar_path}'. Checked prepared_root and dataset-name fallback.")
             handle = tarfile.open(tar_path, "r")
             self._tar_cache[key] = handle
         return handle
