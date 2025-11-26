@@ -324,7 +324,7 @@ class Trainer:
                 "f1": float("nan"),
             }
             if self.val_loader is not None:
-                val_metrics = self._run_validation()
+                val_metrics = self._run_validation(epoch)
                 history["val_loss"].append(val_metrics["loss"])
                 history["val_dice"].append(val_metrics["dice"])
                 history["val_iou"].append(val_metrics["iou"])
@@ -422,7 +422,7 @@ class Trainer:
         return running_loss / steps_denominator
 
     @torch.inference_mode()
-    def _run_validation(self) -> Dict[str, float]:
+    def _run_validation(self, epoch: Optional[int] = None) -> Dict[str, float]:
         if self.val_loader is None:
             return {
                 "loss": float("nan"),
@@ -439,7 +439,16 @@ class Trainer:
         steps = 0
         max_val_batches = self.config.max_val_batches
         threshold_stats = self._init_threshold_accumulators()
-        for batch_idx, batch in enumerate(self.val_loader, start=1):
+
+        iterator = self.val_loader
+        if tqdm:
+            total_batches = len(self.val_loader)
+            if max_val_batches is not None:
+                total_batches = min(total_batches, max_val_batches)
+            desc = f"Epoch {epoch} [val]" if epoch is not None else "Validation"
+            iterator = tqdm(self.val_loader, desc=desc, total=total_batches, leave=False)
+
+        for batch_idx, batch in enumerate(iterator, start=1):
             batch = self._prepare_batch(batch)
             images, masks = batch["image"], batch["mask"]
             noise_inputs = self._extract_noise_inputs(batch)
@@ -453,6 +462,14 @@ class Trainer:
 
             total_loss += loss.item()
             steps += 1
+
+            if tqdm:
+                avg_so_far = total_loss / steps if steps else float("nan")
+                try:
+                    iterator.set_postfix({"loss": f"{avg_so_far:.4f}"})
+                except Exception:
+                    pass
+
             if max_val_batches is not None and batch_idx >= max_val_batches:
                 break
         avg_loss = total_loss / steps if steps else float("nan")
