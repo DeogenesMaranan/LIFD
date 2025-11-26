@@ -465,7 +465,7 @@ class DataPreparationPipeline:
 
         output_path = self._build_output_path(split_name, sample, target_size, variant_tag)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(output_path, **arrays)
+        np.savez(output_path, **arrays)
 
         entry = {
             **meta,
