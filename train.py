@@ -260,6 +260,27 @@ class Trainer:
 
         return DataLoader(dataset, **loader_kwargs)
 
+    def _build_scheduler(self):
+        """Build learning-rate scheduler based on config.
+
+        This method lives on the Trainer so `self._build_scheduler()` called
+        from `__init__` resolves correctly even if there's an accidental
+        duplicate definition elsewhere in the file.
+        """
+        sched_type = (self.config.lr_scheduler_type or "").lower()
+        if sched_type == "plateau":
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                factor=self.config.lr_scheduler_factor,
+                patience=self.config.lr_scheduler_patience,
+            )
+        if sched_type == "cosine":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.config.num_epochs,
+            )
+        return None
+
 
 class DataPrefetcher:
     """Simple prefetcher that moves batches to `device` on a separate CUDA stream.
