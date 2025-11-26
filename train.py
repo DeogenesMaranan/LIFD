@@ -109,15 +109,18 @@ class Trainer:
         amp_enabled = config.use_amp and self.device.type == "cuda"
         if amp_enabled:
             try:
-                self.scaler = amp.GradScaler(device_type="cuda", enabled=True)
-                self._autocast_factory = lambda enabled=True: amp.autocast(
-                    device_type="cuda", enabled=enabled
-                )
+                self.scaler = amp.GradScaler("cuda", enabled=True)
+                self._autocast_factory = lambda enabled=True: amp.autocast("cuda", enabled=enabled)
             except TypeError:
-                from torch.cuda.amp import GradScaler as LegacyGradScaler, autocast as legacy_autocast
+                
+                try:
+                    self.scaler = amp.GradScaler(device_type="cuda", enabled=True)
+                    self._autocast_factory = lambda enabled=True: amp.autocast(device_type="cuda", enabled=enabled)
+                except Exception:
+                    from torch.cuda.amp import GradScaler as LegacyGradScaler, autocast as legacy_autocast
 
-                self.scaler = LegacyGradScaler(enabled=True)
-                self._autocast_factory = lambda enabled=True: legacy_autocast(enabled=enabled)
+                    self.scaler = LegacyGradScaler(enabled=True)
+                    self._autocast_factory = lambda enabled=True: legacy_autocast(enabled=enabled)
         else:
             self.scaler = amp.GradScaler(enabled=False)
 
@@ -132,9 +135,6 @@ class Trainer:
         self.best_val_loss = math.inf
         self._epochs_without_improvement = 0
         self.start_epoch = 1
-        # Priority: explicit `resume_from` wins. Otherwise, if configured,
-        # automatically continue from the latest epoch checkpoint found in
-        # the checkpoint directory.
         if self.config.resume_from:
             self.start_epoch = self._load_checkpoint(self.config.resume_from)
         elif getattr(self.config, "auto_continue_latest", False):

@@ -2,6 +2,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import timm
+import logging
+
+# Reduce noisy timm warnings when adapting pretrained weights to a modified
+# model (e.g. different classifier / batchnorm buffers). The timm builder
+# logs unexpected keys at WARNING level; raise to ERROR to keep console
+# output cleaner during normal training runs.
+try:
+    logging.getLogger("timm.models._builder").setLevel(logging.ERROR)
+except Exception:
+    pass
 
 
 class SegFormerMiTBackbone(nn.Module):
