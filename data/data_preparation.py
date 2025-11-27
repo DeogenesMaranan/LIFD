@@ -1053,6 +1053,15 @@ if __name__ == "__main__":
         ),
         DatasetStructureConfig(
             dataset_root="./datasets",
+            dataset_name="IMD2020",
+            real_subdir="real",
+            fake_subdir="fake",
+            mask_subdir="mask",
+            mask_suffix="_mask",
+            prepared_root="prepared",
+        ),
+        DatasetStructureConfig(
+            dataset_root="./datasets",
             dataset_name="COVERAGE",
             real_subdir="real",
             fake_subdir="fake",
@@ -1066,6 +1075,7 @@ if __name__ == "__main__":
     per_dataset_splits = {
         "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=6),
         "FantasticReality": SplitConfig(train=0.8, val=0.2, test=0.0, seed=10),
+        "IMD2020": SplitConfig(train=0.8, val=0.2, test=0.0, seed=20),
         "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=4),
     }
 
@@ -1101,10 +1111,8 @@ if __name__ == "__main__":
             df["prepared_root"] = str(prepared_root)
             combined_dfs.append(df)
 
-    # Write a combined manifest if any dataset produced artifacts
     if combined_dfs:
         combined = pd.concat(combined_dfs, ignore_index=True)
-        # Choose a combined parent: prefer the common parent of all prepared roots
         parents = {str(Path(p).parent) for p in prepared_roots}
         if len(parents) == 1:
             combined_parent = Path(next(iter(parents)))

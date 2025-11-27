@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import json
 from datetime import datetime
 from torch import amp
+import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from data.data_preparation import (
@@ -468,6 +469,24 @@ class Trainer:
                     except Exception:
                         lmax = lmin = lmean = float('nan')
                     print(f"Warning: non-finite logits detected at epoch={epoch} step={step} max={lmax} min={lmin} mean={lmean}. Skipping batch.")
+                    # Dump diagnostic info for offline inspection: inputs, masks, noise
+                    try:
+                        debug_dir = Path(self.checkpoint_dir) / "debug_bad_batches"
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        img_cpu = images.detach().cpu().numpy()
+                        mask_cpu = masks.detach().cpu().numpy()
+                        noise_cpu = None
+                        if noise_inputs is not None:
+                            noise_cpu = {k: v.detach().cpu().numpy() for k, v in noise_inputs.items()}
+                        save_path = debug_dir / f"bad_batch_epoch{epoch:03d}_step{step:05d}.npz"
+                        # Save images, masks and noise (if any). Use numpy savez for portability.
+                        if noise_cpu is None:
+                            np.savez_compressed(str(save_path), images=img_cpu, masks=mask_cpu)
+                        else:
+                            np.savez_compressed(str(save_path), images=img_cpu, masks=mask_cpu, **noise_cpu)
+                        print(f"Saved debug batch to {save_path}")
+                    except Exception as e:
+                        print(f"Warning: failed to save debug batch: {e}")
                     # Ensure grads are zeroed for safety and continue
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
@@ -497,6 +516,22 @@ class Trainer:
                                 break
                     if not grads_finite:
                         print(f"Warning: non-finite gradients detected at epoch={epoch} step={step}. Skipping optimizer step and zeroing gradients.")
+                        # Save a debug snapshot of gradients to help debugging
+                        try:
+                            grad_debug_dir = Path(self.checkpoint_dir) / "debug_bad_gradients"
+                            grad_debug_dir.mkdir(parents=True, exist_ok=True)
+                            grad_info = {}
+                            for i, p in enumerate(self.model.parameters()):
+                                if p.grad is not None:
+                                    g = p.grad.detach().cpu().float().view(-1)
+                                    grad_info[f"param_{i}_min"] = float(torch.min(g).item())
+                                    grad_info[f"param_{i}_max"] = float(torch.max(g).item())
+                            import json as _json
+                            with open(grad_debug_dir / f"bad_grads_epoch{epoch:03d}_step{step:05d}.json", "w", encoding="utf-8") as fh:
+                                _json.dump(grad_info, fh, indent=2)
+                            print(f"Saved gradient debug info to {grad_debug_dir}")
+                        except Exception:
+                            pass
                         self.optimizer.zero_grad(set_to_none=True)
                         self.scaler.update()
                         accum_counter = 0
