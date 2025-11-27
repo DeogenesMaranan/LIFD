@@ -7,3 +7,4 @@ __pycache__/
 datasets/*
 prepared/*
 checkpoints/*
+sample_data/*
