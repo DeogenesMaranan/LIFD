@@ -458,7 +458,24 @@ class Trainer:
                 logits = self.model(images, noise_features=noise_inputs)
                 if logits.shape[-2:] != masks.shape[-2:]:
                     logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+                # Check for numerical issues in logits before computing loss
+                if not torch.isfinite(logits).all():
+                    # Log diagnostic statistics and skip this batch to avoid corrupting weights
+                    try:
+                        lmax = torch.nanmax(logits.detach())
+                        lmin = torch.nanmin(logits.detach())
+                        lmean = torch.nanmean(logits.detach())
+                    except Exception:
+                        lmax = lmin = lmean = float('nan')
+                    print(f"Warning: non-finite logits detected at epoch={epoch} step={step} max={lmax} min={lmin} mean={lmean}. Skipping batch.")
+                    # Ensure grads are zeroed for safety and continue
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
                 loss, _ = self.loss_fn(logits, masks)
+                if not torch.isfinite(loss):
+                    print(f"Warning: non-finite loss detected at epoch={epoch} step={step} (loss={loss}). Skipping batch.")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
             running_loss += loss.item()
 
             scaled_loss = loss / accum_target
@@ -469,8 +486,23 @@ class Trainer:
             should_step = accum_counter == accum_target or step == total_steps or reached_cap
             if should_step:
                 if self.config.grad_clip_norm is not None:
+                    # Unscale before clipping so norms are correct
                     self.scaler.unscale_(self.optimizer)
+                    # If any gradients are non-finite, skip the optimizer step
+                    grads_finite = True
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            if not torch.isfinite(p.grad).all():
+                                grads_finite = False
+                                break
+                    if not grads_finite:
+                        print(f"Warning: non-finite gradients detected at epoch={epoch} step={step}. Skipping optimizer step and zeroing gradients.")
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.scaler.update()
+                        accum_counter = 0
+                        continue
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                # Final step: allow scaler to perform the step (it will internally skip on overflow)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -522,7 +554,20 @@ class Trainer:
                 logits = self.model(images, noise_features=noise_inputs)
             if logits.shape[-2:] != masks.shape[-2:]:
                 logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+            # Detect numerical issues and skip the offending batch rather than producing NaN metrics
+            if not torch.isfinite(logits).all():
+                try:
+                    lmax = torch.nanmax(logits.detach())
+                    lmin = torch.nanmin(logits.detach())
+                    lmean = torch.nanmean(logits.detach())
+                except Exception:
+                    lmax = lmin = lmean = float('nan')
+                print(f"Warning: non-finite logits detected during validation epoch={epoch} batch={batch_idx} max={lmax} min={lmin} mean={lmean}. Skipping batch.")
+                continue
             loss, _ = self.loss_fn(logits, masks)
+            if not torch.isfinite(loss):
+                print(f"Warning: non-finite validation loss at epoch={epoch} batch={batch_idx} (loss={loss}). Skipping batch.")
+                continue
             probs = torch.sigmoid(logits)
             self._update_threshold_stats(probs, masks, threshold_stats)
 

@@ -100,6 +100,16 @@ def evaluate_split(
                 logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
             loss = criterion(logits, masks)
             probs = torch.sigmoid(logits)
+            # Skip batches with non-finite logits/loss to avoid NaN metrics
+            if not torch.isfinite(logits).all() or not torch.isfinite(loss):
+                try:
+                    lmax = torch.nanmax(logits.detach())
+                    lmin = torch.nanmin(logits.detach())
+                    lmean = torch.nanmean(logits.detach())
+                except Exception:
+                    lmax = lmin = lmean = float('nan')
+                print(f"Warning: non-finite logits detected during evaluation batch={batch_idx} max={lmax} min={lmin} mean={lmean}. Skipping batch.")
+                continue
             for thr in candidate_thresholds:
                 preds = (probs > thr).float()
                 stats = threshold_stats[thr]
