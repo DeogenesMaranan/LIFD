@@ -1035,29 +1035,20 @@ if __name__ == "__main__":
     datasets = [
         DatasetStructureConfig(
             dataset_root="./datasets",
-            dataset_name="CASIA2",
-            real_subdir="real",
-            fake_subdir="fake",
-            mask_subdir="mask",
-            mask_suffix="_gt",
-            prepared_root="prepared",
-        ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
-            dataset_name="FantasticReality",
-            real_subdir="ColorRealImages",
-            fake_subdir="ColorFakeImages",
-            mask_subdir="masks",
-            mask_suffix="",
-            prepared_root="prepared",
-        ),
-        DatasetStructureConfig(
-            dataset_root="./datasets",
             dataset_name="IMD2020",
             real_subdir="real",
             fake_subdir="fake",
             mask_subdir="mask",
             mask_suffix="_mask",
+            prepared_root="prepared",
+        ),
+        DatasetStructureConfig(
+            dataset_root="./datasets",
+            dataset_name="CASIA2",
+            real_subdir="real",
+            fake_subdir="fake",
+            mask_subdir="mask",
+            mask_suffix="_gt",
             prepared_root="prepared",
         ),
         DatasetStructureConfig(
@@ -1074,33 +1065,49 @@ if __name__ == "__main__":
     # Per-dataset split configs (honour dataset-specific seeds)
     per_dataset_splits = {
         "CASIA2": SplitConfig(train=0.8, val=0.2, test=0.0, seed=6),
-        "FantasticReality": SplitConfig(train=0.8, val=0.2, test=0.0, seed=10),
         "IMD2020": SplitConfig(train=0.8, val=0.2, test=0.0, seed=20),
         "COVERAGE": SplitConfig(train=0.0, val=0.0, test=1.0, seed=4),
     }
 
-    # Example preparation + augmentation configuration tuned to keep
-    # storage low while retaining a single influential augmentation.
-    # We produce one augmented variant per sample using a random crop
-    # (scale jitter). Other augmentations are disabled to avoid extra files.
     prep_cfg = PreparationConfig(target_sizes=(320,), normalization_mode="zero_one", compute_high_pass=True)
-    augment_cfg = AugmentationConfig(
-        enable=True,
-        copies_per_sample=1,
-        enable_flips=True,
-        enable_rotations=False,
-        enable_random_crop=False,
-        enable_color_jitter=False,
-        enable_noise=False,
-        max_rotation_degrees=0,
-        crop_scale_range=(0.9, 1.0),
-    )
+
+    per_dataset_augmentations: dict[str, AugmentationConfig] = {
+        "IMD2020": AugmentationConfig(
+            enable=True,
+            copies_per_sample=6,
+            enable_flips=True,
+            enable_rotations=True,
+            max_rotation_degrees=15.0,
+            enable_random_crop=True,
+            crop_scale_range=(0.75, 0.98),
+            enable_color_jitter=True,
+            color_jitter_factors=(0.85, 1.15),
+            enable_noise=True,
+            noise_std_range=(0.0, 0.025),
+        ),
+        "CASIA2": AugmentationConfig(
+            enable=True,
+            copies_per_sample=1,
+            enable_flips=True,
+            enable_random_crop=True,
+            crop_scale_range=(0.9, 0.98),
+            enable_rotations=False,
+            enable_color_jitter=False,
+            enable_noise=False,
+        ),
+        "COVERAGE": AugmentationConfig(
+            enable=False,
+            copies_per_sample=0
+        ),
+    }
+
 
     combined_dfs = []
     prepared_roots = []
     for ds in datasets:
         print(f"Preparing dataset '{ds.dataset_name}'...")
         split_cfg = per_dataset_splits.get(ds.dataset_name, SplitConfig())
+        augment_cfg = per_dataset_augmentations.get(ds.dataset_name, AugmentationConfig())
         pipeline = DataPreparationPipeline(ds, split_cfg, prep_cfg, augment_cfg)
         df = pipeline.prepare()
         prepared_root = ds.prepared_path()
