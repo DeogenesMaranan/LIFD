@@ -81,6 +81,12 @@ class TrainConfig:
     early_stopping_patience: Optional[int] = None
     early_stopping_min_delta: float = 1e-4
     model_config: HybridForgeryConfig = field(default_factory=HybridForgeryConfig)
+    # Optional per-backbone overrides for learning rate and weight decay.
+    # Keys should match the backbone names used by `HybridForgeryDetector`'s
+    # `self.backbones` ModuleDict (e.g. 'efficientnet', 'swin', 'segformer')
+    # and the noise branch name 'noise' if present.
+    backbone_learning_rates: Dict[str, float] = field(default_factory=dict)
+    backbone_weight_decays: Dict[str, float] = field(default_factory=dict)
 
     def resolved_device(self) -> torch.device:
         if self.device:
@@ -104,9 +110,44 @@ class Trainer:
             self.model = model.to(self.device)
             self._use_channels_last = False
         self.loss_fn = CombinedSegmentationLoss(config.loss_config).to(self.device)
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-        )
+        # Build optimizer parameter groups that allow per-backbone lr / weight decay
+        default_lr = float(config.learning_rate)
+        default_wd = float(config.weight_decay or 0.0)
+        param_groups = []
+        assigned_param_ids = set()
+
+        # Helper to add a module's parameters as a group if any params exist
+        def _add_group(module: nn.Module, name: str):
+            params = [p for p in module.parameters() if p.requires_grad]
+            if not params:
+                return
+            for p in params:
+                assigned_param_ids.add(id(p))
+            lr = config.backbone_learning_rates.get(name, default_lr)
+            wd = config.backbone_weight_decays.get(name, default_wd)
+            param_groups.append({"params": params, "lr": float(lr), "weight_decay": float(wd)})
+
+        # Add explicit backbone groups (from ModuleDict)
+        try:
+            for bk_name, bk_module in getattr(self.model, "backbones", {}).items():
+                _add_group(bk_module, bk_name)
+        except Exception:
+            # If for any reason backbones aren't accessible, ignore and fall back
+            pass
+
+        # Add noise branch if present and overrides supplied (or to keep distinct WD/LR)
+        try:
+            if getattr(self.model, "noise_branch", None) is not None:
+                _add_group(self.model.noise_branch, "noise")
+        except Exception:
+            pass
+
+        # Remaining params (not yet assigned) use defaults
+        remaining_params = [p for p in self.model.parameters() if p.requires_grad and id(p) not in assigned_param_ids]
+        if remaining_params:
+            param_groups.append({"params": remaining_params, "lr": default_lr, "weight_decay": default_wd})
+
+        self.optimizer = torch.optim.AdamW(param_groups)
         self.scheduler = self._build_scheduler()
 
         raw_thresholds = config.eval_thresholds or [0.5]
