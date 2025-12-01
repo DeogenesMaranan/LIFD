@@ -592,6 +592,24 @@ class DataPreparationPipeline:
         noised = np.clip(arr + noise, 0, 255).astype(np.uint8)
         return Image.fromarray(noised)
 
+def compute_high_pass(image_uint8: np.ndarray, gaussian_radius: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute high-pass and residual for an uint8 image.
+
+    This is a small exported helper that mirrors
+    ``DataPreparationPipeline._compute_high_pass_features`` so external
+    code (e.g. inference notebooks) can reuse the exact same logic.
+    """
+    image_float = image_uint8.astype(np.float32)
+    pil_image = Image.fromarray(image_uint8)
+    blurred = pil_image.filter(ImageFilter.GaussianBlur(radius=max(0.1, gaussian_radius)))
+    blurred_arr = np.array(blurred, dtype=np.float32)
+    residual = image_float - blurred_arr
+    high_pass = np.abs(residual)
+    if np.max(high_pass) > 0:
+        high_pass = high_pass / 255.0
+    residual = residual / 255.0
+    return high_pass.astype(np.float32), residual.astype(np.float32)
+
 # ----------------- PyTorch Dataset Loader ----------------- #
 class PreparedForgeryDataset(TorchDataset):
     def __init__(self, prepared_root: Path | str | Sequence[Path | str], split: str, target_size: int,
