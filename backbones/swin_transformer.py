@@ -54,5 +54,50 @@ class SwinTinyBackbone(nn.Module):
 
         if self.enforce_input_size and self.expected_hw and x.shape[-2:] != self.expected_hw:
             x = F.interpolate(x, size=self.expected_hw, mode="bilinear", align_corners=False)
+        else:
+            self._maybe_update_patch_embed_shape(x)
         features = self.model(x)
         return list(features)
+
+    def _maybe_update_patch_embed_shape(self, x: torch.Tensor) -> None:
+        """Update the internal patch embedding shape so Swin accepts arbitrary inputs."""
+
+        patch_embed = getattr(self.model, "patch_embed", None)
+        if patch_embed is None:
+            return
+        h, w = x.shape[-2:]
+        current_size = getattr(patch_embed, "img_size", None)
+        new_size = (h, w)
+        if current_size == new_size:
+            return
+        patch_embed.img_size = new_size
+        patch_size = getattr(patch_embed, "patch_size", (4, 4))
+        if hasattr(patch_embed, "grid_size") and patch_size is not None:
+            patch_h = patch_size[0]
+            patch_w = patch_size[1]
+            if h % patch_h != 0 or w % patch_w != 0:
+                raise ValueError(
+                    "Input spatial dims must be multiples of the Swin patch size (4) for variable resizing."
+                )
+            grid_size = (h // patch_h, w // patch_w)
+            patch_embed.grid_size = grid_size
+            if hasattr(patch_embed, "num_patches"):
+                patch_embed.num_patches = grid_size[0] * grid_size[1]
+
+        self._update_stage_resolutions(new_size)
+
+    def _update_stage_resolutions(self, spatial_size: tuple[int, int]) -> None:
+        patch_embed = getattr(self.model, "patch_embed", None)
+        if patch_embed is None:
+            return
+        patch_size = getattr(patch_embed, "patch_size", (4, 4))
+        feat_size = (spatial_size[0] // patch_size[0], spatial_size[1] // patch_size[1])
+        idx = 0
+        while True:
+            stage = getattr(self.model, f"layers_{idx}", None)
+            if stage is None:
+                break
+            window = stage.blocks[0].window_size[0] if stage.blocks else 7
+            stage.set_input_size(feat_size, window_size=window)
+            feat_size = stage.output_resolution
+            idx += 1
